@@ -16,10 +16,16 @@ FIELD_X_HALF = 4.5
 FIELD_Y_HALF = 3.0
 RIGHT_GOAL = (4.5, 0.0)
 LEFT_GOAL = (-4.5, 0.0)
+GOAL_DEPTH = 0.6
+GOAL_HALF_WIDTH = 0.8
+ARENA_X_HALF = 5.1
+ARENA_Y_HALF = 3.6
 CORNERS = [(-4.5, 3.0), (-4.5, -3.0), (4.5, 3.0), (4.5, -3.0)]
 PENALTY_CROSSES = [(3.25, 0.0), (-3.25, 0.0)]
 CENTER_CIRCLE = (0.0, 0.0)
 MAX_WHEEL_SPEED = 6.0
+RL_FORWARD_SCALE = 5.6
+RL_TURN_SCALE = 3.2
 VISUALIZER_DEFAULT_ENABLED = True
 OBSERVATION_FOV = math.pi / 2.0
 
@@ -63,6 +69,17 @@ def clip_to_field(point, padding=0.05):
         clamp(point[0], -FIELD_X_HALF + padding, FIELD_X_HALF - padding),
         clamp(point[1], -FIELD_Y_HALF + padding, FIELD_Y_HALF - padding),
     )
+
+
+def clip_to_arena(point, padding=0.05):
+    return (
+        clamp(point[0], -ARENA_X_HALF + padding, ARENA_X_HALF - padding),
+        clamp(point[1], -ARENA_Y_HALF + padding, ARENA_Y_HALF - padding),
+    )
+
+
+def clip_ball_position(point, padding=0.05):
+    return clip_to_arena(point, padding=padding)
 
 
 @dataclass
@@ -353,7 +370,10 @@ class BallTracker:
 
     def update(self, pose, ball_obs):
         if ball_obs is not None:
-            observed_position = clip_to_field(polar_to_world(pose, ball_obs), padding=0.10)
+            observed_position = clip_ball_position(
+                polar_to_world(pose, ball_obs),
+                padding=0.10,
+            )
             if self.position is None or self.age > 20:
                 self.position = observed_position
             else:
@@ -437,45 +457,233 @@ class LiveVisualizerClient:
         self.enabled = False
 
 
+class TransitionLogger:
+    def __init__(self):
+        self.handle = None
+        trace_path = os.environ.get("RL_TRACE_PATH")
+        if not trace_path:
+            return
+        try:
+            self.handle = open(trace_path, "a", encoding="utf-8", buffering=1)
+            atexit.register(self.close)
+        except OSError:
+            self.handle = None
+
+    def log(self, payload):
+        if self.handle is None:
+            return
+        try:
+            self.handle.write(json.dumps(payload) + "\n")
+        except OSError:
+            self.close()
+
+    def close(self):
+        if self.handle is None:
+            return
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+        self.handle = None
+
+
+class EmbeddedActorPolicy:
+    INPUT_DIM = 16
+    HIDDEN_DIM = 64
+    RUNTIME_WEIGHTS_FILENAME = "rl_policy_weights.npz"
+    FEATURE_NAMES = (
+        "ball_visible",
+        "ball_dist_norm",
+        "sin_ball_angle",
+        "cos_ball_angle",
+        "goal_dist_norm",
+        "sin_goal_angle",
+        "cos_goal_angle",
+        "staging_dist_norm",
+        "sin_staging_angle",
+        "cos_staging_angle",
+        "ball_goal_alignment_norm",
+        "localizer_confidence",
+        "ball_age_norm",
+        "prev_forward_cmd",
+        "prev_turn_cmd",
+        "wall_margin_norm",
+    )
+
+    def __init__(self):
+        self.source = "embedded_bootstrap"
+        runtime_weights = self._load_runtime_actor()
+        if runtime_weights is not None:
+            self.w1, self.b1, self.w2, self.b2, self.w3, self.b3 = runtime_weights
+        else:
+            self.w1, self.b1, self.w2, self.b2, self.w3, self.b3 = self._build_bootstrap_actor()
+
+    def _runtime_weights_path(self):
+        env_path = os.environ.get("RL_POLICY_WEIGHTS_PATH")
+        if env_path:
+            candidate = Path(env_path).expanduser()
+            if candidate.exists():
+                return candidate
+            print(f"RL policy weights path not found, falling back to embedded weights: {candidate}")
+            return None
+
+        candidate = Path(__file__).with_name(self.RUNTIME_WEIGHTS_FILENAME)
+        if candidate.exists():
+            return candidate
+        return None
+
+    def _load_runtime_actor(self):
+        candidate = self._runtime_weights_path()
+        if candidate is None:
+            return None
+
+        expected_shapes = {
+            "w1": (self.HIDDEN_DIM, self.INPUT_DIM),
+            "b1": (self.HIDDEN_DIM,),
+            "w2": (self.HIDDEN_DIM, self.HIDDEN_DIM),
+            "b2": (self.HIDDEN_DIM,),
+            "w3": (2, self.HIDDEN_DIM),
+            "b3": (2,),
+        }
+
+        try:
+            with np.load(candidate) as data:
+                arrays = []
+                for key, shape in expected_shapes.items():
+                    if key not in data:
+                        raise KeyError(f"missing key {key}")
+                    array = np.asarray(data[key], dtype=np.float32)
+                    if array.shape != shape:
+                        raise ValueError(f"{key} has shape {array.shape}, expected {shape}")
+                    arrays.append(array)
+        except Exception as exc:
+            print(f"Failed to load RL policy weights from {candidate}: {exc}")
+            return None
+
+        self.source = str(candidate)
+        print(f"Loaded RL policy weights from {candidate}")
+        return tuple(arrays)
+
+    def _build_bootstrap_actor(self):
+        w1 = np.zeros((self.HIDDEN_DIM, self.INPUT_DIM), dtype=np.float32)
+        b1 = np.zeros(self.HIDDEN_DIM, dtype=np.float32)
+        w2 = np.zeros((self.HIDDEN_DIM, self.HIDDEN_DIM), dtype=np.float32)
+        b2 = np.zeros(self.HIDDEN_DIM, dtype=np.float32)
+        w3 = np.zeros((2, self.HIDDEN_DIM), dtype=np.float32)
+        b3 = np.array([-0.55, 0.0], dtype=np.float32)
+
+        for i in range(self.INPUT_DIM):
+            w1[i, i] = 1.35
+            w1[16 + i, i] = -1.35
+            w2[i, i] = 1.0
+            w2[16 + i, 16 + i] = 1.0
+
+        # Hand-shaped combination units. These are a bootstrap actor that can later
+        # be replaced by exported trained weights without changing controller code.
+        w1[32, 0] = 1.0
+        w1[32, 1] = 1.0
+        w1[32, 11] = 0.7
+
+        w1[33, 7] = 1.0
+        w1[33, 9] = 0.9
+        w1[33, 3] = 0.4
+
+        w1[34, 2] = 0.8
+        w1[34, 8] = 1.2
+        w1[34, 5] = 0.4
+
+        w1[35, 10] = 1.0
+        w1[35, 6] = 0.5
+        w1[35, 15] = 0.4
+
+        w1[36, 12] = -1.0
+        w1[36, 15] = 0.8
+        w1[36, 11] = 0.4
+
+        w1[37, 13] = 0.8
+        w1[37, 14] = -0.4
+        w1[37, 1] = 0.4
+
+        w1[38, 5] = 0.9
+        w1[38, 2] = -0.5
+
+        for i in range(32, 39):
+            w2[i, i] = 1.0
+
+        # Forward action.
+        w3[0, 0] = 0.70   # ball_visible
+        w3[0, 1] = 0.85   # ball_dist_norm
+        w3[0, 3] = 0.75   # cos_ball_angle
+        w3[0, 4] = 0.20   # goal_dist_norm
+        w3[0, 6] = 0.20   # cos_goal_angle
+        w3[0, 7] = 0.55   # staging_dist_norm
+        w3[0, 9] = 0.40   # cos_staging_angle
+        w3[0, 10] = 0.55  # ball_goal_alignment_norm
+        w3[0, 11] = 0.45  # localizer_confidence
+        w3[0, 12] = -0.55 # ball_age_norm
+        w3[0, 13] = 0.20  # prev_forward_cmd
+        w3[0, 15] = 0.45  # wall_margin_norm
+        w3[0, 32] = 0.55
+        w3[0, 33] = 0.50
+        w3[0, 35] = 0.30
+        w3[0, 36] = 0.35
+        w3[0, 37] = 0.18
+
+        # Turn action.
+        w3[1, 2] = 0.65   # sin_ball_angle
+        w3[1, 5] = 0.45   # sin_goal_angle
+        w3[1, 8] = 1.10   # sin_staging_angle
+        w3[1, 14] = 0.18  # prev_turn_cmd
+        w3[1, 34] = 0.95
+        w3[1, 38] = 0.55
+        w3[1, 36] = -0.10
+
+        return w1, b1, w2, b2, w3, b3
+
+    def __call__(self, features):
+        h1 = np.tanh(self.w1 @ features + self.b1)
+        h2 = np.tanh(self.w2 @ h1 + self.b2)
+        return np.tanh(self.w3 @ h2 + self.b3)
+
+
 class StudentController:
     def __init__(self):
         self.localizer = MultiHypothesisLocalizer()
         self.ball_tracker = BallTracker()
         self.visualizer = LiveVisualizerClient()
+        self.transition_logger = TransitionLogger()
+        self.actor = EmbeddedActorPolicy()
+
         self.state = "SEARCH_BALL"
         self.state_age = 0
         self.step_count = 0
         self.search_direction = 1.0
         self.attack_goal = RIGHT_GOAL
 
+        self.prev_forward_cmd = 0.0
+        self.prev_turn_cmd = 0.0
+        self.low_confidence_steps = 0
+        self.no_progress_steps = 0
+        self.prev_ball_goal_dist = None
+        self.last_seen_ball_rel = None
+        self.last_rl_features = np.zeros(self.actor.INPUT_DIM, dtype=np.float32)
+        self.last_rl_action = np.zeros(2, dtype=np.float32)
+        self.last_rl_context = {}
+
     def _set_state(self, new_state):
         if new_state != self.state:
             self.state = new_state
             self.state_age = 0
+            if new_state != "RL_BALL_PLAY":
+                self.no_progress_steps = 0
+                self.prev_ball_goal_dist = None
 
     def _wheel_command(self, forward, turn):
+        self.prev_forward_cmd = clamp(forward / RL_FORWARD_SCALE, -1.0, 1.0)
+        self.prev_turn_cmd = clamp(turn / RL_TURN_SCALE, -1.0, 1.0)
         left = clamp(forward - turn, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
         right = clamp(forward + turn, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
         return {"left_motor": left, "right_motor": right}
-
-    def _drive_to_point(self, pose, target, max_speed=5.0, stop_radius=0.08):
-        dx = target[0] - pose[0]
-        dy = target[1] - pose[1]
-        target_distance = math.hypot(dx, dy)
-        heading_error = wrap_to_pi(math.atan2(dy, dx) - pose[2])
-
-        if target_distance < stop_radius:
-            return self._wheel_command(0.0, 0.0)
-
-        if abs(heading_error) > 0.9:
-            forward = 0.0
-        else:
-            forward = min(max_speed, 4.5 * target_distance) * max(0.2, math.cos(heading_error))
-        if target_distance < 0.35:
-            forward *= target_distance / 0.35
-
-        turn = clamp(4.0 * heading_error, -3.2, 3.2)
-        return self._wheel_command(forward, turn)
 
     def _search_control(self):
         if self.step_count % 80 == 0:
@@ -483,6 +691,9 @@ class StudentController:
         forward = 0.3 if self.localizer.confidence > 0.25 else 0.0
         turn = 2.3 * self.search_direction
         return self._wheel_command(forward, turn)
+
+    def _wall_margin(self, pose):
+        return min(ARENA_X_HALF - abs(pose[0]), ARENA_Y_HALF - abs(pose[1]))
 
     def _staging_point(self, ball_position):
         goal_dx = self.attack_goal[0] - ball_position[0]
@@ -497,31 +708,162 @@ class StudentController:
         )
         return clip_to_field(staging, padding=0.20)
 
-    def _push_ball_control(self, pose, ball_rel):
-        goal_rel = relative_polar(pose, self.attack_goal)
-        ball_distance, ball_angle = ball_rel
-        goal_angle = goal_rel[1]
-
-        forward = 5.4
-        if abs(ball_angle) > 0.28:
-            forward *= 0.60
-        elif ball_distance > 0.28:
-            forward *= 0.85
-
-        turn = 4.2 * ball_angle + 1.1 * goal_angle
-        if self.ball_tracker.position is not None and distance(self.ball_tracker.position, self.attack_goal) < 0.8:
-            forward = 5.8
-            turn = 2.4 * ball_angle + 0.6 * goal_angle
-
-        return self._wheel_command(forward, clamp(turn, -3.5, 3.5))
-
     def _ball_observation(self, pose, sensors):
         ball_obs = sensors.get("ball")
         if ball_obs is not None:
+            self.last_seen_ball_rel = tuple(ball_obs)
             return tuple(ball_obs), self.ball_tracker.position
         if self.ball_tracker.is_fresh(max_age=35):
-            return self.ball_tracker.relative_ball(pose), self.ball_tracker.position
+            rel_ball = self.ball_tracker.relative_ball(pose)
+            if rel_ball is not None:
+                return rel_ball, self.ball_tracker.position
         return None, None
+
+    def extract_rl_features(self, pose, sensors):
+        ball_visible = 1.0 if sensors.get("ball") is not None else 0.0
+        ball_rel, ball_position = self._ball_observation(pose, sensors)
+
+        if ball_rel is None:
+            if self.last_seen_ball_rel is not None:
+                ball_rel = self.last_seen_ball_rel
+            else:
+                ball_rel = (2.0, 0.0)
+
+        if ball_position is None and self.ball_tracker.position is not None:
+            ball_position = self.ball_tracker.position
+
+        goal_rel = relative_polar(pose, self.attack_goal)
+        if ball_position is not None:
+            staging_point = self._staging_point(ball_position)
+            staging_rel = relative_polar(pose, staging_point)
+            ball_goal_alignment = math.cos(wrap_to_pi(goal_rel[1] - ball_rel[1]))
+        else:
+            staging_point = None
+            staging_rel = (2.0, 0.0)
+            ball_goal_alignment = -1.0
+
+        wall_margin = self._wall_margin(pose)
+        wall_margin_norm = clamp(wall_margin / 1.5, 0.0, 1.0)
+
+        features = np.array(
+            [
+                ball_visible,
+                clamp(ball_rel[0] / 2.0, 0.0, 1.0),
+                math.sin(ball_rel[1]),
+                math.cos(ball_rel[1]),
+                clamp(goal_rel[0] / 9.0, 0.0, 1.0),
+                math.sin(goal_rel[1]),
+                math.cos(goal_rel[1]),
+                clamp(staging_rel[0] / 2.0, 0.0, 1.0),
+                math.sin(staging_rel[1]),
+                math.cos(staging_rel[1]),
+                ball_goal_alignment,
+                clamp(self.localizer.confidence, 0.0, 1.0),
+                clamp(self.ball_tracker.age / 30.0, 0.0, 1.0),
+                clamp(self.prev_forward_cmd, -1.0, 1.0),
+                clamp(self.prev_turn_cmd, -1.0, 1.0),
+                wall_margin_norm,
+            ],
+            dtype=np.float32,
+        )
+
+        context = {
+            "ball_rel": ball_rel,
+            "ball_position": ball_position,
+            "goal_rel": goal_rel,
+            "staging_point": staging_point,
+            "staging_rel": staging_rel,
+            "wall_margin_norm": wall_margin_norm,
+        }
+        return features, context
+
+    def rl_policy(self, features):
+        return self.actor(features)
+
+    def should_enter_rl(self, sensors):
+        return sensors.get("ball") is not None
+
+    def _update_rl_progress(self, pose, context):
+        if self.localizer.confidence < 0.20:
+            self.low_confidence_steps += 1
+        else:
+            self.low_confidence_steps = 0
+
+        ball_position = context.get("ball_position")
+        if ball_position is None:
+            self.no_progress_steps = 0
+            self.prev_ball_goal_dist = None
+            return
+
+        ball_goal_dist = distance(ball_position, self.attack_goal)
+        if self.prev_ball_goal_dist is None:
+            self.prev_ball_goal_dist = ball_goal_dist
+            self.no_progress_steps = 0
+            return
+
+        progress = self.prev_ball_goal_dist - ball_goal_dist
+        wall_margin = self._wall_margin(pose)
+        if wall_margin < 0.35 and progress < 0.003:
+            self.no_progress_steps += 1
+        else:
+            self.no_progress_steps = 0
+        self.prev_ball_goal_dist = ball_goal_dist
+
+    def should_exit_rl(self, pose, sensors, context):
+        del sensors  # kept for required interface symmetry
+        self._update_rl_progress(pose, context)
+        if self.ball_tracker.age > 8:
+            return True
+        if self.low_confidence_steps >= 10:
+            return True
+        if self.no_progress_steps >= 20:
+            return True
+        return False
+
+    def recover_control(self, pose, context):
+        del context
+        ball_rel = None
+        if self.ball_tracker.is_fresh(max_age=45):
+            ball_rel = self.ball_tracker.relative_ball(pose)
+        elif self.last_seen_ball_rel is not None:
+            ball_rel = self.last_seen_ball_rel
+
+        if ball_rel is None:
+            return self._search_control()
+
+        turn = clamp(2.8 * ball_rel[1], -2.8, 2.8)
+        forward = 0.9 if abs(ball_rel[1]) < 0.35 else 0.0
+        if self.localizer.confidence < 0.15:
+            forward = 0.0
+        return self._wheel_command(forward, turn)
+
+    def _action_to_control(self, action):
+        a_forward = clamp(float(action[0]), -1.0, 1.0)
+        a_turn = clamp(float(action[1]), -1.0, 1.0)
+        forward = RL_FORWARD_SCALE * max(0.0, 0.5 * (a_forward + 1.0))
+        turn = RL_TURN_SCALE * a_turn
+        return self._wheel_command(forward, turn)
+
+    def _log_transition(self, sensors, pose, control):
+        if self.transition_logger.handle is None:
+            return
+        truth = sensors.get("debug_truth", {})
+        self.transition_logger.log(
+            {
+                "step": self.step_count,
+                "state": self.state,
+                "estimated_pose": [float(v) for v in pose],
+                "actual_pose": truth.get("robot_pose"),
+                "estimated_ball": None if self.ball_tracker.position is None else [float(v) for v in self.ball_tracker.position],
+                "actual_ball": truth.get("ball_position"),
+                "features": [float(v) for v in self.last_rl_features],
+                "action": [float(v) for v in self.last_rl_action],
+                "control": {
+                    "left_motor": float(control["left_motor"]),
+                    "right_motor": float(control["right_motor"]),
+                },
+            }
+        )
 
     def _publish_visualizer(self, sensors, pose):
         if self.visualizer is None or not self.visualizer.enabled:
@@ -561,6 +903,8 @@ class StudentController:
                     for key, values in landmark_debug["matched"].items()
                 },
             },
+            "rl_features": [float(v) for v in self.last_rl_features],
+            "rl_action": [float(v) for v in self.last_rl_action],
         }
         self.visualizer.publish(snapshot)
 
@@ -580,46 +924,35 @@ class StudentController:
         self.localizer.predict(sensors.get("odometry"))
         pose = self.localizer.update(sensors)
         self.ball_tracker.update(pose, sensors.get("ball"))
-        ball_rel, ball_position = self._ball_observation(pose, sensors)
 
-        if ball_rel is None:
-            self._set_state("SEARCH_BALL")
-            control = self._search_control()
-            self._publish_visualizer(sensors, pose)
-            return control
+        features, context = self.extract_rl_features(pose, sensors)
+        self.last_rl_features = features
+        self.last_rl_context = context
 
-        if self.state == "SEARCH_BALL":
-            self._set_state("GO_TO_BALL")
+        if self.state == "SEARCH_BALL" and self.should_enter_rl(sensors):
+            self._set_state("RL_BALL_PLAY")
+        elif self.state == "RECOVER":
+            if self.should_enter_rl(sensors):
+                self._set_state("RL_BALL_PLAY")
+            elif self.state_age >= 30:
+                self._set_state("SEARCH_BALL")
 
-        if self.state == "GO_TO_BALL":
-            staging_point = self._staging_point(ball_position)
-            distance_to_staging = distance((pose[0], pose[1]), staging_point)
-            if (
-                ball_rel[0] < 0.45
-                and abs(ball_rel[1]) < 0.18
-                and distance_to_staging < 0.18
-            ):
-                self._set_state("PUSH_BALL")
-            elif distance_to_staging > 0.10:
-                control = self._drive_to_point(pose, staging_point, max_speed=4.8, stop_radius=0.10)
-                self._publish_visualizer(sensors, pose)
-                return control
+        if self.state == "RL_BALL_PLAY":
+            if self.should_exit_rl(pose, sensors, context):
+                self._set_state("RECOVER")
+                self.last_rl_action = np.zeros(2, dtype=np.float32)
+                control = self.recover_control(pose, context)
             else:
-                control = self._drive_to_point(pose, ball_position, max_speed=3.2, stop_radius=0.04)
-                self._publish_visualizer(sensors, pose)
-                return control
+                action = self.rl_policy(features)
+                self.last_rl_action = np.asarray(action, dtype=np.float32)
+                control = self._action_to_control(action)
+        elif self.state == "RECOVER":
+            self.last_rl_action = np.zeros(2, dtype=np.float32)
+            control = self.recover_control(pose, context)
+        else:
+            self.last_rl_action = np.zeros(2, dtype=np.float32)
+            control = self._search_control()
 
-        if self.state == "PUSH_BALL":
-            if ball_rel[0] > 0.70 or abs(ball_rel[1]) > 0.42:
-                self._set_state("GO_TO_BALL")
-                staging_point = self._staging_point(ball_position)
-                control = self._drive_to_point(pose, staging_point, max_speed=4.2, stop_radius=0.10)
-                self._publish_visualizer(sensors, pose)
-                return control
-            control = self._push_ball_control(pose, ball_rel)
-            self._publish_visualizer(sensors, pose)
-            return control
-
-        control = self._search_control()
+        self._log_transition(sensors, pose, control)
         self._publish_visualizer(sensors, pose)
         return control

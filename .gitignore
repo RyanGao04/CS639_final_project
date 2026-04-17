@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__/
 *.pyc
+tmp/rl_traces/
+tmp/rl_checkpoints/
+/final_project/controllers/robot_one_controller/rl_policy_weights.npz
