@@ -85,6 +85,17 @@ python scripts/rl_workflow.py deepbots-record explore_001 --policy random
 python scripts/rl_workflow.py deepbots-train --name sac_v1 --timesteps 50000 --activate
 ```
 
+默认会用当前 bootstrap/runtime actor warm-start SAC 的 mean policy，并把 `learning_starts` 设为 0，避免前 1000 step 纯随机探索。
+
+更推荐的高效流程是先用 bootstrap actor 收集成功轨迹，再用这些轨迹做一次 BC，然后让 SAC 从 BC actor 开始在线微调：
+
+```bash
+python scripts/rl_workflow.py deepbots-record bootstrap_success --policy actor --batch --webots-mode fast
+python scripts/rl_workflow.py filter-success tmp/rl_traces/bootstrap_success_deepbots.jsonl --name bootstrap_success_only
+python scripts/rl_workflow.py train-activate tmp/rl_traces/bootstrap_success_only_success.jsonl --name bc_bootstrap
+python scripts/rl_workflow.py deepbots-train --name sac_from_bc --warm-start-weights final_project/controllers/robot_one_controller/rl_policy_weights.npz --timesteps 50000 --activate
+```
+
 默认训练时用 `--mode=fast --batch` 自动启动 Webots。想看 GUI 可以加：
 
 ```bash

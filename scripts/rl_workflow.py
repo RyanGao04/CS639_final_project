@@ -152,6 +152,23 @@ def _collect_trace_files(patterns, trace_dir):
     return deduped
 
 
+def _trace_episode_key(path, row):
+    info = row.get("info") or {}
+    episode = row.get("episode", info.get("episode_index", 0))
+    return str(path), episode
+
+
+def _row_scored_correct_goal(row):
+    info = row.get("info") or {}
+    if info.get("correct_goal"):
+        return True
+
+    ball = row.get("actual_ball") or row.get("estimated_ball")
+    if ball is None or len(ball) < 2:
+        return False
+    return float(ball[0]) > 4.5 and abs(float(ball[1])) <= 0.8
+
+
 def _extract_arrays(state_dict):
     direct_keys = ("w1", "b1", "w2", "b2", "w3", "b3")
     if all(key in state_dict for key in direct_keys):
@@ -319,6 +336,12 @@ def _base_deepbots_env(args, trace_path=None):
         env["RL_TRACE_PATH"] = str(trace_path)
     if getattr(args, "weights", None):
         env["RL_POLICY_WEIGHTS_PATH"] = str(Path(args.weights).expanduser().resolve())
+    if getattr(args, "warm_start", None):
+        env["RL_DEEPBOTS_WARM_START"] = args.warm_start
+    if getattr(args, "warm_start_weights", None):
+        env["RL_DEEPBOTS_WARM_START_WEIGHTS"] = str(Path(args.warm_start_weights).expanduser().resolve())
+    if getattr(args, "sac_log_std_init", None) is not None:
+        env["RL_DEEPBOTS_SAC_LOG_STD_INIT"] = str(args.sac_log_std_init)
     return env
 
 
@@ -374,7 +397,11 @@ def cmd_deepbots_train(args):
     env["RL_DEEPBOTS_MODE"] = "sac_train"
     env["RL_DEEPBOTS_TOTAL_STEPS"] = str(args.timesteps)
     env["RL_DEEPBOTS_MODEL_PATH"] = str(model_path)
-    env["RL_DEEPBOTS_LEARNING_STARTS"] = str(args.learning_starts)
+    learning_starts = args.learning_starts
+    if learning_starts is None:
+        has_warm_start = args.warm_start != "none" or args.warm_start_weights is not None
+        learning_starts = 0 if has_warm_start else 1000
+    env["RL_DEEPBOTS_LEARNING_STARTS"] = str(learning_starts)
     env["RL_DEEPBOTS_BATCH_SIZE"] = str(args.batch_size)
     env["RL_DEEPBOTS_LR"] = str(args.lr)
     env["RL_DEEPBOTS_GAMMA"] = str(args.gamma)
@@ -394,6 +421,11 @@ def cmd_deepbots_train(args):
     print(f"Transition trace: {trace_path}")
     if "RL_DEEPBOTS_EXPORT_PATH" in env:
         print(f"Runtime export: {env['RL_DEEPBOTS_EXPORT_PATH']}")
+    if "RL_DEEPBOTS_WARM_START" in env:
+        print(f"SAC warm start: {env['RL_DEEPBOTS_WARM_START']}")
+    if "RL_DEEPBOTS_WARM_START_WEIGHTS" in env:
+        print(f"SAC warm start weights: {env['RL_DEEPBOTS_WARM_START_WEIGHTS']}")
+    print(f"SAC learning starts: {learning_starts}")
 
     if args.launch_webots:
         return _launch_webots(args, env, args.world)
@@ -410,6 +442,9 @@ def cmd_deepbots_train(args):
             "RL_DEEPBOTS_TOTAL_STEPS",
             "RL_DEEPBOTS_MODEL_PATH",
             "RL_DEEPBOTS_EXPORT_PATH",
+            "RL_DEEPBOTS_WARM_START",
+            "RL_DEEPBOTS_WARM_START_WEIGHTS",
+            "RL_DEEPBOTS_SAC_LOG_STD_INIT",
             "RL_DEEPBOTS_LEARNING_STARTS",
             "RL_DEEPBOTS_BATCH_SIZE",
             "RL_DEEPBOTS_LR",
@@ -474,6 +509,54 @@ def cmd_install_rl_deps(args):
         return 0
     completed = subprocess.run(cmd, cwd=ROOT)
     return completed.returncode
+
+
+def cmd_filter_success(args):
+    trace_dir = _ensure_dir(args.trace_dir)
+    trace_files = _collect_trace_files(args.traces, trace_dir)
+    if not trace_files:
+        raise SystemExit("No trace files found.")
+
+    run_name = _normalize_name(args.name or _timestamp())
+    output_path = Path(args.output).expanduser().resolve() if args.output else trace_dir / f"{run_name}_success.jsonl"
+
+    episodes = {}
+    order = []
+    total_rows = 0
+    for path in trace_files:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                total_rows += 1
+                key = _trace_episode_key(path, row)
+                if key not in episodes:
+                    episodes[key] = {"rows": [], "success": False}
+                    order.append(key)
+                episodes[key]["rows"].append(row)
+                if _row_scored_correct_goal(row):
+                    episodes[key]["success"] = True
+
+    selected = [episodes[key] for key in order if episodes[key]["success"]]
+    if not selected:
+        raise SystemExit("No successful correct-goal episodes found in the provided traces.")
+
+    _ensure_dir(output_path.parent)
+    written_rows = 0
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for episode in selected:
+            for row in episode["rows"]:
+                handle.write(json.dumps(row) + "\n")
+                written_rows += 1
+
+    print(f"Input traces: {len(trace_files)}")
+    print(f"Input rows: {total_rows}")
+    print(f"Successful episodes: {len(selected)} / {len(episodes)}")
+    print(f"Output rows: {written_rows}")
+    print(f"Success trace: {output_path}")
+    return 0
 
 
 def cmd_deactivate(args):
@@ -566,10 +649,13 @@ def build_parser():
     deepbots_train.add_argument("--activate", action="store_true", help="Export the trained SAC deterministic actor to the runtime .npz weights.")
     deepbots_train.add_argument("--runtime-output", type=Path, help="Runtime .npz output path for --activate.")
     deepbots_train.add_argument("--timesteps", type=int, default=50000)
-    deepbots_train.add_argument("--learning-starts", type=int, default=1000)
+    deepbots_train.add_argument("--learning-starts", type=int, help="Defaults to 0 when SAC warm-start is enabled, otherwise 1000.")
     deepbots_train.add_argument("--batch-size", type=int, default=256)
     deepbots_train.add_argument("--lr", type=float, default=3e-4)
     deepbots_train.add_argument("--gamma", type=float, default=0.995)
+    deepbots_train.add_argument("--warm-start", choices=("bootstrap", "runtime", "none"), default="bootstrap", help="Initialize SAC actor from the embedded/runtime actor before online learning.")
+    deepbots_train.add_argument("--warm-start-weights", type=Path, help="Specific runtime .npz actor weights for SAC warm-start.")
+    deepbots_train.add_argument("--sac-log-std-init", type=float, default=-1.2, help="Initial SAC log standard deviation when warm-starting the actor.")
     deepbots_train.add_argument("--phase", type=int, default=2)
     deepbots_train.add_argument("--max-episode-steps", type=int, default=1800)
     deepbots_train.add_argument("--seed", type=int, default=7)
@@ -622,6 +708,13 @@ def build_parser():
     install_deps = subparsers.add_parser("install-rl-deps", help="Install Python packages needed for deepbots SAC training.")
     install_deps.add_argument("--dry-run", action="store_true")
     install_deps.set_defaults(func=cmd_install_rl_deps)
+
+    filter_success = subparsers.add_parser("filter-success", help="Keep only trace episodes that scored on the correct goal.")
+    filter_success.add_argument("traces", nargs="*", help="Trace files, directories, or glob patterns. Default: tmp/rl_traces/*.jsonl")
+    filter_success.add_argument("--name", help="Output run name.")
+    filter_success.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    filter_success.add_argument("--output", type=Path, help="Filtered JSONL output path.")
+    filter_success.set_defaults(func=cmd_filter_success)
 
     return parser
 

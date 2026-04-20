@@ -98,6 +98,8 @@ from starter_controller import (  # noqa: E402
 FEATURE_DIM = 16
 ACTION_DIM = 2
 BALL_Z = 0.07
+RUNTIME_WEIGHTS_FILENAME = "rl_policy_weights.npz"
+RUNTIME_WEIGHTS_PATH = ROBOT_CONTROLLER_DIR / RUNTIME_WEIGHTS_FILENAME
 
 
 def _env_int(name, default):
@@ -559,6 +561,87 @@ class GymnasiumAdapter(gym.Env):
         self.deepbots_env.close()
 
 
+def _actor_arrays_from_embedded_policy():
+    policy = EmbeddedActorPolicy()
+    return {
+        "w1": np.asarray(policy.w1, dtype=np.float32),
+        "b1": np.asarray(policy.b1, dtype=np.float32),
+        "w2": np.asarray(policy.w2, dtype=np.float32),
+        "b2": np.asarray(policy.b2, dtype=np.float32),
+        "w3": np.asarray(policy.w3, dtype=np.float32),
+        "b3": np.asarray(policy.b3, dtype=np.float32),
+    }, policy.source
+
+
+def _load_actor_arrays_npz(path):
+    expected = {
+        "w1": (64, FEATURE_DIM),
+        "b1": (64,),
+        "w2": (64, 64),
+        "b2": (64,),
+        "w3": (ACTION_DIM, 64),
+        "b3": (ACTION_DIM,),
+    }
+    path = Path(path).expanduser()
+    with np.load(path) as data:
+        arrays = {}
+        for key, shape in expected.items():
+            if key not in data:
+                raise RuntimeError(f"{path} is missing actor array {key}")
+            array = np.asarray(data[key], dtype=np.float32)
+            if array.shape != shape:
+                raise RuntimeError(f"{path}:{key} has shape {array.shape}, expected {shape}")
+            arrays[key] = array
+    return arrays, str(path)
+
+
+def _copy_linear(layer, weight, bias):
+    import torch
+
+    if tuple(layer.weight.shape) != tuple(weight.shape):
+        raise RuntimeError(f"Linear weight shape {tuple(layer.weight.shape)} does not match {weight.shape}")
+    if tuple(layer.bias.shape) != tuple(bias.shape):
+        raise RuntimeError(f"Linear bias shape {tuple(layer.bias.shape)} does not match {bias.shape}")
+
+    with torch.no_grad():
+        layer.weight.copy_(torch.as_tensor(weight, dtype=layer.weight.dtype, device=layer.weight.device))
+        layer.bias.copy_(torch.as_tensor(bias, dtype=layer.bias.dtype, device=layer.bias.device))
+
+
+def warm_start_sac_actor(model, arrays, log_std_init):
+    import torch
+    import torch.nn as nn
+
+    actor = model.policy.actor
+    linear_layers = [module for module in actor.latent_pi.modules() if isinstance(module, nn.Linear)]
+    if len(linear_layers) != 2:
+        raise RuntimeError("Expected SAC latent_pi to contain exactly two Linear layers.")
+
+    _copy_linear(linear_layers[0], arrays["w1"], arrays["b1"])
+    _copy_linear(linear_layers[1], arrays["w2"], arrays["b2"])
+    _copy_linear(actor.mu, arrays["w3"], arrays["b3"])
+
+    if hasattr(actor, "log_std") and isinstance(actor.log_std, nn.Linear):
+        with torch.no_grad():
+            actor.log_std.weight.zero_()
+            actor.log_std.bias.fill_(float(log_std_init))
+
+
+def resolve_warm_start_arrays(mode, weights_path):
+    mode = (mode or "none").strip().lower()
+    if weights_path:
+        return _load_actor_arrays_npz(weights_path)
+    if mode == "none":
+        return None, None
+    if mode == "bootstrap":
+        return _actor_arrays_from_embedded_policy()
+    if mode == "runtime":
+        if not RUNTIME_WEIGHTS_PATH.exists():
+            raise RuntimeError(f"Runtime actor weights not found: {RUNTIME_WEIGHTS_PATH}")
+        return _load_actor_arrays_npz(RUNTIME_WEIGHTS_PATH)
+    raise RuntimeError(f"Unsupported RL_DEEPBOTS_WARM_START={mode!r}")
+
+
 def export_sac_actor(model, output_path):
     import torch.nn as nn
 
@@ -685,6 +768,15 @@ def run_sac_training(env):
         verbose=1,
         tensorboard_log=tensorboard_dir,
     )
+
+    warm_start_mode = os.environ.get("RL_DEEPBOTS_WARM_START", "none")
+    warm_start_weights = os.environ.get("RL_DEEPBOTS_WARM_START_WEIGHTS")
+    log_std_init = _env_float("RL_DEEPBOTS_SAC_LOG_STD_INIT", -1.2)
+    warm_arrays, warm_source = resolve_warm_start_arrays(warm_start_mode, warm_start_weights)
+    if warm_arrays is not None:
+        warm_start_sac_actor(model, warm_arrays, log_std_init=log_std_init)
+        print(f"Warm-started SAC actor from {warm_source} with log_std_init={log_std_init}")
+
     model.learn(total_timesteps=total_timesteps, log_interval=10)
     model.save(str(model_path))
     print(f"Saved SAC model to {model_path}")
