@@ -4,9 +4,11 @@
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import shutil
+import site
 import subprocess
 import sys
 
@@ -20,13 +22,17 @@ TRAIN_SCRIPT = CONTROLLER_DIR / "train_rl_actor_from_traces.py"
 RUNTIME_WEIGHTS_PATH = CONTROLLER_DIR / "rl_policy_weights.npz"
 TRACE_DIR = ROOT / "tmp" / "rl_traces"
 CHECKPOINT_DIR = ROOT / "tmp" / "rl_checkpoints"
+EVAL_DIR = ROOT / "tmp" / "rl_eval"
+LOCALIZATION_METRICS_DIR = ROOT / "tmp" / "localization_metrics"
+HIGH_INFO_LANDMARK_BINS = {"goal_structural", "2plus_mixed"}
 DEFAULT_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo.wbt"
 DEEPBOTS_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo_deepbots.wbt"
 DEEPBOTS_CONTROLLER = ROOT / "final_project" / "controllers" / "rl_training_controller" / "rl_training_controller.py"
+DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS = 6000
 
 
 EXPECTED_SHAPES = {
-    "w1": (64, 16),
+    "w1": (64, 19),
     "b1": (64,),
     "w2": (64, 64),
     "b2": (64,),
@@ -88,11 +94,25 @@ def _resolve_world_path(world):
 def _webots_command(webots_bin, world_path, mode=None, batch=False):
     cmd = [str(webots_bin)]
     if batch:
-        cmd.append("--batch")
+        cmd.extend(["--batch", "--no-rendering"])
+    cmd.extend(["--stdout", "--stderr"])
     if mode:
         cmd.append(f"--mode={mode}")
     cmd.append(str(world_path))
     return cmd
+
+
+def _ensure_deepbots_runtime_ini():
+    controller_dir = DEEPBOTS_CONTROLLER.parent
+    python_command = Path(sys.executable).absolute()
+    content = f"[python]\nCOMMAND = {python_command}\n"
+    written = []
+    for filename in ("runtime.ini", "config.ini"):
+        path = controller_dir / filename
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            path.write_text(content, encoding="utf-8")
+        written.append(path)
+    return written
 
 
 def _launch_webots(args, env, world):
@@ -105,6 +125,9 @@ def _launch_webots(args, env, world):
     world_path = _resolve_world_path(world)
     if not world_path.exists():
         raise SystemExit(f"World file not found: {world_path}")
+    if "RL_DEEPBOTS_MODE" in env:
+        runtime_paths = _ensure_deepbots_runtime_ini()
+        print(f"Deepbots Python config: {', '.join(str(path) for path in runtime_paths)}")
 
     launch_cmd = _webots_command(
         webots_bin,
@@ -256,6 +279,138 @@ def cmd_record(args):
     return 0
 
 
+def _sample_submission_ball_positions(args):
+    if getattr(args, "fixed_ball_x", None) is not None or getattr(args, "fixed_ball_y", None) is not None:
+        if args.fixed_ball_x is None or args.fixed_ball_y is None:
+            raise SystemExit("--fixed-ball-x and --fixed-ball-y must be provided together.")
+        return [
+            (round(float(args.fixed_ball_x), 4), round(float(args.fixed_ball_y), 4))
+            for _ in range(args.episodes)
+        ]
+
+    rng = np.random.default_rng(args.seed)
+    positions = []
+    max_attempts = max(200, args.episodes * 50)
+    for _ in range(max_attempts):
+        ball_x = float(rng.uniform(args.x_min, args.x_max))
+        ball_y = float(rng.uniform(args.y_min, args.y_max))
+        if math.hypot(ball_x + 1.0, ball_y) < args.min_robot_dist:
+            continue
+        positions.append((round(ball_x, 4), round(ball_y, 4)))
+        if len(positions) >= args.episodes:
+            break
+    if len(positions) < args.episodes:
+        raise SystemExit("Could not sample enough valid ball positions for submission-eval.")
+    return positions
+
+
+def cmd_submission_eval(args):
+    eval_dir = _ensure_dir(args.eval_dir)
+    trace_dir = _ensure_dir(args.trace_dir)
+    run_name = _normalize_name(args.name or _timestamp())
+    output_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output
+        else eval_dir / f"{run_name}_submission_summary.json"
+    )
+    positions = _sample_submission_ball_positions(args)
+    results = []
+
+    for episode_index, (ball_x, ball_y) in enumerate(positions, start=1):
+        trace_path = trace_dir / f"{run_name}_submission_ep{episode_index:02d}.jsonl"
+        summary_path = eval_dir / f"{run_name}_submission_ep{episode_index:02d}.json"
+        if trace_path.exists():
+            trace_path.unlink()
+        if summary_path.exists():
+            summary_path.unlink()
+
+        env = os.environ.copy()
+        env["RL_TRACE_PATH"] = str(trace_path)
+        env["WEBOTS_LIVE_VISUALIZER"] = "1" if args.visualizer else "0"
+        env["WEBOTS_SUBMISSION_BALL_X"] = str(ball_x)
+        env["WEBOTS_SUBMISSION_BALL_Y"] = str(ball_y)
+        env["WEBOTS_SUBMISSION_MAX_STEPS"] = str(args.max_steps)
+        env["WEBOTS_SUBMISSION_SUMMARY_PATH"] = str(summary_path)
+        env["WEBOTS_SUBMISSION_LABEL"] = f"{run_name}_ep{episode_index:02d}"
+        if args.weights:
+            env["RL_POLICY_WEIGHTS_PATH"] = str(Path(args.weights).expanduser().resolve())
+        if args.residual_blend is not None:
+            env["RL_RESIDUAL_BLEND"] = str(args.residual_blend)
+
+        print(
+            f"[submission-eval] episode {episode_index}/{args.episodes} "
+            f"ball=({ball_x:.3f}, {ball_y:.3f})"
+        )
+        rc = _launch_webots(args, env, args.world)
+        if rc != 0:
+            result = {
+                "episode": episode_index,
+                "ball_init": [ball_x, ball_y],
+                "outcome": "launch_error",
+                "returncode": rc,
+                "trace_path": str(trace_path),
+            }
+        elif not summary_path.exists():
+            result = {
+                "episode": episode_index,
+                "ball_init": [ball_x, ball_y],
+                "outcome": "missing_summary",
+                "returncode": rc,
+                "trace_path": str(trace_path),
+            }
+        else:
+            with open(summary_path, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+            result["episode"] = episode_index
+            result["returncode"] = rc
+            result["trace_path"] = str(trace_path)
+            result["summary_path"] = str(summary_path)
+
+        results.append(result)
+        print(
+            "[submission-eval] "
+            f"outcome={result['outcome']} "
+            f"step={result.get('step', -1)} "
+            f"got_to_ball={result.get('got_to_ball', False)}"
+        )
+
+    successes = sum(result.get("outcome") == "correct_goal" for result in results)
+    wrong_goals = sum(result.get("outcome") == "wrong_goal" for result in results)
+    timeouts = sum(result.get("outcome") == "timeout" for result in results)
+    got_to_ball = sum(bool(result.get("got_to_ball")) for result in results)
+    summary = {
+        "run_name": run_name,
+        "episodes_requested": args.episodes,
+        "episodes_completed": len(results),
+        "seed": args.seed,
+        "world": str(_resolve_world_path(args.world)),
+        "max_steps": args.max_steps,
+        "successes": successes,
+        "wrong_goals": wrong_goals,
+        "timeouts": timeouts,
+        "launch_errors": sum(
+            result.get("outcome") in {"launch_error", "missing_summary"} for result in results
+        ),
+        "success_rate": successes / len(results) if results else 0.0,
+        "get_to_ball_rate": got_to_ball / len(results) if results else 0.0,
+        "results": results,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    print(
+        "Submission eval: "
+        f"success_rate={summary['success_rate']:.3f} "
+        f"successes={successes}/{len(results)} "
+        f"wrong={wrong_goals} "
+        f"timeouts={timeouts} "
+        f"get_to_ball={got_to_ball}/{len(results)}"
+    )
+    print(f"Summary: {output_path}")
+    return 0 if summary["launch_errors"] == 0 else 1
+
+
 def _run_train_subprocess(trace_files, output_path, args):
     cmd = [
         sys.executable,
@@ -271,6 +426,8 @@ def _run_train_subprocess(trace_files, output_path, args):
         str(args.lr),
         "--gamma",
         str(args.gamma),
+        "--weighting",
+        args.weighting,
         "--device",
         args.device,
     ]
@@ -328,6 +485,13 @@ def _deepbots_trace_path(args, suffix="deepbots", run_name=None):
 
 def _base_deepbots_env(args, trace_path=None):
     env = os.environ.copy()
+    python_bin_dir = Path(sys.executable).resolve().parent
+    env["PATH"] = f"{python_bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    site_paths = [path for path in site.getsitepackages() if Path(path).exists()]
+    if site_paths:
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(site_paths + ([existing_pythonpath] if existing_pythonpath else []))
+    env["PYTHONUNBUFFERED"] = "1"
     env["RL_DEEPBOTS_PHASE"] = str(args.phase)
     env["RL_DEEPBOTS_MAX_STEPS"] = str(args.max_episode_steps)
     env["RL_DEEPBOTS_SEED"] = str(args.seed)
@@ -336,12 +500,25 @@ def _base_deepbots_env(args, trace_path=None):
         env["RL_TRACE_PATH"] = str(trace_path)
     if getattr(args, "weights", None):
         env["RL_POLICY_WEIGHTS_PATH"] = str(Path(args.weights).expanduser().resolve())
+    if getattr(args, "actor_source", None):
+        env["RL_DEEPBOTS_ACTOR_SOURCE"] = args.actor_source
     if getattr(args, "warm_start", None):
         env["RL_DEEPBOTS_WARM_START"] = args.warm_start
     if getattr(args, "warm_start_weights", None):
         env["RL_DEEPBOTS_WARM_START_WEIGHTS"] = str(Path(args.warm_start_weights).expanduser().resolve())
     if getattr(args, "sac_log_std_init", None) is not None:
         env["RL_DEEPBOTS_SAC_LOG_STD_INIT"] = str(args.sac_log_std_init)
+    if getattr(args, "demo_traces", None):
+        demo_paths = [str(Path(path).expanduser().resolve()) for path in args.demo_traces]
+        env["RL_DEEPBOTS_DEMO_TRACES"] = os.pathsep.join(demo_paths)
+    if getattr(args, "demo_limit", None) is not None:
+        env["RL_DEEPBOTS_DEMO_LIMIT"] = str(args.demo_limit)
+    if getattr(args, "ent_coef", None) is not None:
+        env["RL_DEEPBOTS_ENT_COEF"] = str(args.ent_coef)
+    if getattr(args, "gradient_steps", None) is not None:
+        env["RL_DEEPBOTS_GRADIENT_STEPS"] = str(args.gradient_steps)
+    if getattr(args, "terminate_out_of_play", False):
+        env["RL_DEEPBOTS_TERMINATE_OUT_OF_PLAY"] = "1"
     return env
 
 
@@ -352,7 +529,13 @@ def cmd_deepbots_record(args):
     run_name = _normalize_name(args.name or _timestamp())
     trace_path = _deepbots_trace_path(args, run_name=run_name)
     env = _base_deepbots_env(args, trace_path=trace_path)
-    mode = "sac_eval" if args.policy == "sac" else args.policy
+    if args.policy == "sac":
+        mode = "sac_eval"
+    elif args.policy == "bootstrap":
+        mode = "actor"
+        env["RL_DEEPBOTS_ACTOR_SOURCE"] = "bootstrap"
+    else:
+        mode = args.policy
     env["RL_DEEPBOTS_MODE"] = mode
     if args.model:
         env["RL_DEEPBOTS_MODEL_PATH"] = str(Path(args.model).expanduser().resolve())
@@ -377,6 +560,69 @@ def cmd_deepbots_record(args):
             "RL_DEEPBOTS_MAX_STEPS",
             "RL_DEEPBOTS_SEED",
             "RL_POLICY_WEIGHTS_PATH",
+            "RL_DEEPBOTS_ACTOR_SOURCE",
+            "RL_DEEPBOTS_MODEL_PATH",
+        ),
+    )
+    return 0
+
+
+def cmd_deepbots_eval(args):
+    eval_dir = _ensure_dir(args.eval_dir)
+    run_name = _normalize_name(args.name or _timestamp())
+    output_path = Path(args.output).expanduser().resolve() if args.output else eval_dir / f"{run_name}_summary.json"
+    trace_path = _deepbots_trace_path(args, suffix="eval", run_name=run_name) if args.trace else None
+
+    if args.policy == "sac" and not args.model:
+        raise SystemExit("--policy sac requires --model pointing to an SB3 SAC .zip file.")
+
+    env = _base_deepbots_env(args, trace_path=trace_path)
+    env["RL_DEEPBOTS_MODE"] = "eval"
+    env["RL_DEEPBOTS_EVAL_POLICY"] = args.policy
+    env["RL_DEEPBOTS_EVAL_EPISODES"] = str(args.episodes)
+    env["RL_DEEPBOTS_EVAL_OUTPUT"] = str(output_path)
+    if args.policy == "bootstrap":
+        env["RL_DEEPBOTS_EVAL_POLICY"] = "bootstrap"
+        env["RL_DEEPBOTS_ACTOR_SOURCE"] = "bootstrap"
+    if args.model:
+        env["RL_DEEPBOTS_MODEL_PATH"] = str(Path(args.model).expanduser().resolve())
+
+    print("Deepbots mode: eval")
+    print(f"Policy: {args.policy}")
+    print(f"Episodes: {args.episodes}")
+    print(f"Eval summary: {output_path}")
+    if trace_path is not None:
+        print(f"Eval trace: {trace_path}")
+
+    if args.launch_webots:
+        rc = _launch_webots(args, env, args.world)
+        if output_path.exists():
+            with open(output_path, "r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            print(
+                "Eval result: "
+                f"success_rate={summary.get('success_rate', 0.0):.3f} "
+                f"successes={summary.get('successes', 0)}/{summary.get('episodes_completed', 0)} "
+                f"wrong={summary.get('wrong_goals', 0)} "
+                f"timeouts={summary.get('timeouts', 0)} "
+                f"mean_steps={summary.get('mean_episode_steps', 0.0):.1f}"
+            )
+        return rc
+
+    _print_env_exports(
+        env,
+        (
+            "RL_DEEPBOTS_MODE",
+            "RL_DEEPBOTS_EVAL_POLICY",
+            "RL_DEEPBOTS_EVAL_EPISODES",
+            "RL_DEEPBOTS_EVAL_OUTPUT",
+            "RL_DEEPBOTS_TRACE_PATH",
+            "RL_TRACE_PATH",
+            "RL_DEEPBOTS_PHASE",
+            "RL_DEEPBOTS_MAX_STEPS",
+            "RL_DEEPBOTS_SEED",
+            "RL_POLICY_WEIGHTS_PATH",
+            "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
         ),
     )
@@ -445,6 +691,11 @@ def cmd_deepbots_train(args):
             "RL_DEEPBOTS_WARM_START",
             "RL_DEEPBOTS_WARM_START_WEIGHTS",
             "RL_DEEPBOTS_SAC_LOG_STD_INIT",
+            "RL_DEEPBOTS_DEMO_TRACES",
+            "RL_DEEPBOTS_DEMO_LIMIT",
+            "RL_DEEPBOTS_ENT_COEF",
+            "RL_DEEPBOTS_GRADIENT_STEPS",
+            "RL_DEEPBOTS_TERMINATE_OUT_OF_PLAY",
             "RL_DEEPBOTS_LEARNING_STARTS",
             "RL_DEEPBOTS_BATCH_SIZE",
             "RL_DEEPBOTS_LR",
@@ -559,6 +810,471 @@ def cmd_filter_success(args):
     return 0
 
 
+def summarize_trace_files(trace_files):
+    summaries = []
+    for path in trace_files:
+        episodes = {}
+        total_rows = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            total_rows += 1
+            key = _trace_episode_key(path, row)
+            info = row.get("info") or {}
+            episode = episodes.setdefault(
+                key,
+                {"rows": 0, "success": False, "wrong": False, "max_step": 0},
+            )
+            episode["rows"] += 1
+            episode["success"] = episode["success"] or _row_scored_correct_goal(row)
+            episode["wrong"] = episode["wrong"] or bool(info.get("wrong_goal"))
+            episode["max_step"] = max(
+                episode["max_step"],
+                int(row.get("episode_step", info.get("episode_step", 0)) or 0),
+            )
+
+        if not episodes:
+            summaries.append(
+                {
+                    "path": str(path),
+                    "rows": 0,
+                    "episodes": 0,
+                    "successes": 0,
+                    "wrong_goals": 0,
+                    "success_rate": 0.0,
+                    "mean_episode_steps": 0.0,
+                    "max_episode_steps": 0,
+                }
+            )
+            continue
+
+        successes = sum(episode["success"] for episode in episodes.values())
+        wrong_goals = sum(episode["wrong"] for episode in episodes.values())
+        lengths = [
+            episode["max_step"] or episode["rows"]
+            for episode in episodes.values()
+        ]
+        summaries.append(
+            {
+                "path": str(path),
+                "rows": total_rows,
+                "episodes": len(episodes),
+                "successes": successes,
+                "wrong_goals": wrong_goals,
+                "success_rate": successes / len(episodes),
+                "mean_episode_steps": float(np.mean(lengths)),
+                "max_episode_steps": int(max(lengths)),
+            }
+        )
+    return summaries
+
+
+def cmd_trace_summary(args):
+    trace_dir = _ensure_dir(args.trace_dir)
+    trace_files = _collect_trace_files(args.traces, trace_dir)
+    if not trace_files:
+        raise SystemExit("No trace files found.")
+
+    summaries = summarize_trace_files(trace_files)
+    for summary in summaries:
+        print(
+            f"{Path(summary['path']).name}: "
+            f"rows={summary['rows']} "
+            f"episodes={summary['episodes']} "
+            f"success={summary['successes']} "
+            f"wrong={summary['wrong_goals']} "
+            f"success_rate={summary['success_rate']:.3f} "
+            f"mean_steps={summary['mean_episode_steps']:.1f} "
+            f"max_steps={summary['max_episode_steps']}"
+        )
+    return 0
+
+
+def _quantile(values, percentile):
+    values = sorted(float(value) for value in values if value is not None)
+    if not values:
+        return None
+    index = int(round((len(values) - 1) * percentile))
+    index = max(0, min(len(values) - 1, index))
+    return values[index]
+
+
+def _metric_summary(values):
+    values = [float(value) for value in values if value is not None]
+    if not values:
+        return {"count": 0, "mean": None, "p50": None, "p95": None, "p99": None, "max": None}
+    return {
+        "count": len(values),
+        "mean": float(np.mean(values)),
+        "p50": _quantile(values, 0.50),
+        "p95": _quantile(values, 0.95),
+        "p99": _quantile(values, 0.99),
+        "max": max(values),
+    }
+
+
+def _angle_error(a, b):
+    return abs((float(a) - float(b) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _pose_error_from_row(row, pose_key):
+    actual = row.get("actual_pose")
+    pose = row.get(pose_key)
+    if actual is None or pose is None:
+        return None, None
+    return (
+        math.hypot(float(pose[0]) - float(actual[0]), float(pose[1]) - float(actual[1])),
+        _angle_error(pose[2], actual[2]),
+    )
+
+
+def _pose_jump_from_rows(prev_row, row, pose_key):
+    if prev_row is None:
+        return None, None
+    prev_pose = prev_row.get(pose_key)
+    pose = row.get(pose_key)
+    if prev_pose is None or pose is None:
+        return None, None
+    return (
+        math.hypot(float(pose[0]) - float(prev_pose[0]), float(pose[1]) - float(prev_pose[1])),
+        _angle_error(pose[2], prev_pose[2]),
+    )
+
+
+def _localization_from_row(row, prev_row=None):
+    localization = dict(row.get("localization") or {})
+    fused = dict(localization.get("fused") or {})
+    localizer = dict(localization.get("localizer") or {})
+    odom = dict(localization.get("odom") or {})
+
+    fused_pos, fused_heading = _pose_error_from_row(row, "fused_pose" if row.get("fused_pose") is not None else "estimated_pose")
+    localizer_pos, localizer_heading = _pose_error_from_row(row, "localizer_pose")
+    odom_pos, odom_heading = _pose_error_from_row(row, "odom_pose")
+    fused_jump, fused_heading_jump = _pose_jump_from_rows(prev_row, row, "fused_pose" if row.get("fused_pose") is not None else "estimated_pose")
+
+    fused.setdefault("pos_error", fused_pos)
+    fused.setdefault("heading_error", fused_heading)
+    fused.setdefault("heading_error_deg", None if fused_heading is None else math.degrees(fused_heading))
+    fused.setdefault("pos_jump", fused_jump)
+    fused.setdefault("heading_jump", fused_heading_jump)
+    fused.setdefault("heading_jump_deg", None if fused_heading_jump is None else math.degrees(fused_heading_jump))
+    localizer.setdefault("pos_error", localizer_pos)
+    localizer.setdefault("heading_error", localizer_heading)
+    localizer.setdefault("heading_error_deg", None if localizer_heading is None else math.degrees(localizer_heading))
+    odom.setdefault("pos_error", odom_pos)
+    odom.setdefault("heading_error", odom_heading)
+    odom.setdefault("heading_error_deg", None if odom_heading is None else math.degrees(odom_heading))
+
+    if "landmark_bin" not in localization:
+        goal_count = int(localization.get("goal_count", row.get("goal_count", 0)) or 0)
+        corner_count = int(localization.get("corner_count", row.get("corner_count", 0)) or 0)
+        cross_count = int(localization.get("cross_count", row.get("cross_count", 0)) or 0)
+        center_count = int(localization.get("center_count", row.get("center_count", 0)) or 0)
+        structure_count = corner_count + cross_count + center_count
+        total_count = goal_count + structure_count
+        if total_count == 0:
+            landmark_bin = "0_landmarks"
+        elif structure_count == 0 and goal_count == 1:
+            landmark_bin = "1_goal_only"
+        elif structure_count == 0:
+            landmark_bin = "goal_only_multi"
+        elif structure_count == 1 and goal_count == 0:
+            landmark_bin = "1_structural"
+        elif structure_count >= 1 and goal_count >= 1:
+            landmark_bin = "goal_structural"
+        else:
+            landmark_bin = "2plus_mixed"
+        localization.update(
+            {
+                "goal_count": goal_count,
+                "corner_count": corner_count,
+                "cross_count": cross_count,
+                "center_count": center_count,
+                "structure_count": structure_count,
+                "total_count": total_count,
+                "landmark_bin": landmark_bin,
+            }
+        )
+
+    localization["fused"] = fused
+    localization["localizer"] = localizer
+    localization["odom"] = odom
+    localization.setdefault("pose_correction_trust", row.get("pose_correction_trust"))
+    localization.setdefault("localizer_confidence", row.get("localizer_confidence"))
+    return localization
+
+
+def _summarize_localization_rows(rows):
+    by_bin = {}
+    high_info = {
+        "fused_pos_error": [],
+        "fused_heading_error_deg": [],
+        "fused_pos_jump": [],
+        "localizer_pos_error": [],
+        "odom_pos_error": [],
+        "pose_correction_trust": [],
+        "localizer_confidence": [],
+    }
+    overall = {
+        "fused_pos_error": [],
+        "fused_heading_error_deg": [],
+        "fused_pos_jump": [],
+        "localizer_pos_error": [],
+        "odom_pos_error": [],
+        "pose_correction_trust": [],
+        "localizer_confidence": [],
+    }
+    calibration_violations = []
+    large_jump_rows = []
+    first_large_error = None
+    prev_row = None
+    prev_trace_path = None
+
+    for row in rows:
+        trace_path = row.get("_trace_path")
+        if trace_path != prev_trace_path:
+            prev_row = None
+            prev_trace_path = trace_path
+        localization = _localization_from_row(row, prev_row)
+        prev_row = row
+        bin_name = localization.get("landmark_bin", "unknown")
+        bucket = by_bin.setdefault(
+            bin_name,
+            {
+                "fused_pos_error": [],
+                "fused_heading_error_deg": [],
+                "fused_pos_jump": [],
+                "localizer_pos_error": [],
+                "odom_pos_error": [],
+                "pose_correction_trust": [],
+                "localizer_confidence": [],
+            },
+        )
+        fused = localization.get("fused", {})
+        localizer = localization.get("localizer", {})
+        odom = localization.get("odom", {})
+        values = {
+            "fused_pos_error": fused.get("pos_error"),
+            "fused_heading_error_deg": fused.get("heading_error_deg"),
+            "fused_pos_jump": fused.get("pos_jump"),
+            "localizer_pos_error": localizer.get("pos_error"),
+            "odom_pos_error": odom.get("pos_error"),
+            "pose_correction_trust": localization.get("pose_correction_trust"),
+            "localizer_confidence": localization.get("localizer_confidence"),
+        }
+        for key, value in values.items():
+            if value is not None:
+                overall[key].append(value)
+                bucket[key].append(value)
+                if bin_name in HIGH_INFO_LANDMARK_BINS:
+                    high_info[key].append(value)
+
+        fused_error = values["fused_pos_error"]
+        trust = values["pose_correction_trust"]
+        jump = values["fused_pos_jump"]
+        if first_large_error is None and fused_error is not None and fused_error > 0.5:
+            first_large_error = {
+                "trace_path": row.get("_trace_path"),
+                "step": row.get("step"),
+                "fused_pos_error": fused_error,
+                "landmark_bin": bin_name,
+                "state": row.get("state"),
+                "rl_submode": row.get("rl_submode"),
+            }
+        if fused_error is not None and trust is not None and fused_error > 0.5 and trust >= 0.075:
+            calibration_violations.append(
+                {
+                    "trace_path": row.get("_trace_path"),
+                    "step": row.get("step"),
+                    "fused_pos_error": fused_error,
+                    "trust": trust,
+                    "landmark_bin": bin_name,
+                    "state": row.get("state"),
+                }
+            )
+        if jump is not None and jump > 0.375:
+            large_jump_rows.append(
+                {
+                    "trace_path": row.get("_trace_path"),
+                    "step": row.get("step"),
+                    "fused_pos_jump": jump,
+                    "fused_pos_error": fused_error,
+                    "landmark_bin": bin_name,
+                    "state": row.get("state"),
+                }
+            )
+
+    def summarize_bucket(bucket):
+        return {
+            key: _metric_summary(values)
+            for key, values in bucket.items()
+        }
+
+    summary = {
+        "rows": len(rows),
+        "overall": summarize_bucket(overall),
+        "high_info": summarize_bucket(high_info),
+        "high_info_bins": sorted(HIGH_INFO_LANDMARK_BINS),
+        "by_landmark_bin": {
+            bin_name: summarize_bucket(bucket)
+            for bin_name, bucket in sorted(by_bin.items())
+        },
+        "failure_windows": {
+            "first_fused_error_gt_0_5m": first_large_error,
+            "top_fused_errors": [],
+            "top_fused_jumps": sorted(large_jump_rows, key=lambda item: item["fused_pos_jump"], reverse=True)[:10],
+            "calibration_violations": calibration_violations[:20],
+            "calibration_violation_count": len(calibration_violations),
+        },
+    }
+
+    ranked_errors = []
+    prev_row = None
+    prev_trace_path = None
+    for row in rows:
+        trace_path = row.get("_trace_path")
+        if trace_path != prev_trace_path:
+            prev_row = None
+            prev_trace_path = trace_path
+        localization = _localization_from_row(row, prev_row)
+        prev_row = row
+        fused = localization.get("fused", {})
+        fused_error = fused.get("pos_error")
+        if fused_error is not None:
+            ranked_errors.append(
+                {
+                    "trace_path": row.get("_trace_path"),
+                    "step": row.get("step"),
+                    "fused_pos_error": fused_error,
+                    "fused_pos_jump": fused.get("pos_jump"),
+                    "landmark_bin": localization.get("landmark_bin"),
+                    "trust": localization.get("pose_correction_trust"),
+                    "confidence": localization.get("localizer_confidence"),
+                    "state": row.get("state"),
+                    "rl_submode": row.get("rl_submode"),
+                }
+            )
+    summary["failure_windows"]["top_fused_errors"] = sorted(
+        ranked_errors, key=lambda item: item["fused_pos_error"], reverse=True
+    )[:10]
+
+    high_info_error_rows = [
+        item
+        for item in ranked_errors
+        if item.get("landmark_bin") in HIGH_INFO_LANDMARK_BINS
+    ]
+    high_info_large_jumps = [
+        item
+        for item in high_info_error_rows
+        if (item.get("fused_pos_jump") or 0.0) > 0.225
+    ]
+    summary["failure_windows"]["top_high_info_fused_errors"] = sorted(
+        high_info_error_rows, key=lambda item: item["fused_pos_error"], reverse=True
+    )[:10]
+    summary["failure_windows"]["high_info_large_jump_count"] = len(high_info_large_jumps)
+    summary["failure_windows"]["high_info_large_jumps"] = sorted(
+        high_info_large_jumps,
+        key=lambda item: item["fused_pos_jump"] or 0.0,
+        reverse=True,
+    )[:10]
+
+    gates = {
+        "fused_pos_p50_lt_0_10": (summary["overall"]["fused_pos_error"]["p50"] or float("inf")) < 0.10,
+        "fused_pos_p95_lt_0_275": (summary["overall"]["fused_pos_error"]["p95"] or float("inf")) < 0.275,
+        "heading_p50_lt_4deg": (summary["overall"]["fused_heading_error_deg"]["p50"] or float("inf")) < 4.0,
+        "heading_p95_lt_14deg": (summary["overall"]["fused_heading_error_deg"]["p95"] or float("inf")) < 14.0,
+        "jump_p99_lt_0_125": (summary["overall"]["fused_pos_jump"]["p99"] or float("inf")) < 0.125,
+        "no_jump_gt_0_375": len(large_jump_rows) == 0,
+        "trust_low_when_error_gt_0_5m": len(calibration_violations) == 0,
+        "high_info_fused_pos_p50_lt_0_04": (summary["high_info"]["fused_pos_error"]["p50"] or float("inf")) < 0.04,
+        "high_info_fused_pos_p95_lt_0_15": (summary["high_info"]["fused_pos_error"]["p95"] or float("inf")) < 0.15,
+        "high_info_fused_pos_p99_lt_0_21": (summary["high_info"]["fused_pos_error"]["p99"] or float("inf")) < 0.21,
+        "high_info_heading_p95_lt_3deg": (summary["high_info"]["fused_heading_error_deg"]["p95"] or float("inf")) < 3.0,
+        "high_info_heading_p99_lt_6deg": (summary["high_info"]["fused_heading_error_deg"]["p99"] or float("inf")) < 6.0,
+        "high_info_jump_p99_lt_0_05": (summary["high_info"]["fused_pos_jump"]["p99"] or float("inf")) < 0.05,
+        "high_info_no_jump_gt_0_225": len(high_info_large_jumps) == 0,
+    }
+    summary["acceptance_gates"] = gates
+    summary["passed"] = all(gates.values())
+    return summary
+
+
+def cmd_localization_summary(args):
+    trace_dir = _ensure_dir(args.trace_dir)
+    trace_files = _collect_trace_files(args.traces, trace_dir)
+    if not trace_files:
+        raise SystemExit("No trace files found.")
+
+    rows = []
+    for path in trace_files:
+        prev_row = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            row["_trace_path"] = str(path)
+            row["_localization_for_summary"] = _localization_from_row(row, prev_row)
+            prev_row = row
+            rows.append(row)
+
+    summary = _summarize_localization_rows(rows)
+    summary["trace_files"] = [str(path) for path in trace_files]
+    summary["run_name"] = _normalize_name(args.name or _timestamp())
+
+    metrics_dir = _ensure_dir(args.metrics_dir)
+    output_path = Path(args.output).expanduser().resolve() if args.output else metrics_dir / f"{summary['run_name']}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    aggregate_path = metrics_dir / "aggregate.json"
+    aggregate = []
+    if aggregate_path.exists():
+        try:
+            aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            aggregate = []
+    aggregate_entry = {
+        "run_name": summary["run_name"],
+        "output": str(output_path),
+        "passed": summary["passed"],
+        "rows": summary["rows"],
+        "fused_pos_p50": summary["overall"]["fused_pos_error"]["p50"],
+        "fused_pos_p95": summary["overall"]["fused_pos_error"]["p95"],
+        "heading_p95_deg": summary["overall"]["fused_heading_error_deg"]["p95"],
+        "jump_p99": summary["overall"]["fused_pos_jump"]["p99"],
+        "high_info_fused_pos_p95": summary["high_info"]["fused_pos_error"]["p95"],
+        "high_info_fused_pos_p99": summary["high_info"]["fused_pos_error"]["p99"],
+        "high_info_heading_p95_deg": summary["high_info"]["fused_heading_error_deg"]["p95"],
+        "high_info_heading_p99_deg": summary["high_info"]["fused_heading_error_deg"]["p99"],
+        "high_info_jump_p99": summary["high_info"]["fused_pos_jump"]["p99"],
+        "high_info_large_jumps": summary["failure_windows"]["high_info_large_jump_count"],
+        "calibration_violations": summary["failure_windows"]["calibration_violation_count"],
+    }
+    aggregate.append(aggregate_entry)
+    aggregate_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+
+    print(
+        "Localization summary: "
+        f"passed={summary['passed']} "
+        f"rows={summary['rows']} "
+        f"fused_p50={aggregate_entry['fused_pos_p50']} "
+        f"fused_p95={aggregate_entry['fused_pos_p95']} "
+        f"heading_p95={aggregate_entry['heading_p95_deg']} "
+        f"jump_p99={aggregate_entry['jump_p99']} "
+        f"high_info_p99={aggregate_entry['high_info_fused_pos_p99']} "
+        f"high_info_heading_p99={aggregate_entry['high_info_heading_p99_deg']} "
+        f"high_info_jump_p99={aggregate_entry['high_info_jump_p99']} "
+        f"calib_violations={aggregate_entry['calibration_violations']}"
+    )
+    print(f"Metrics: {output_path}")
+    print(f"Aggregate: {aggregate_path}")
+    return 0 if summary["passed"] or not args.fail_on_gate else 1
+
+
 def cmd_deactivate(args):
     runtime_path = Path(args.runtime_output).expanduser().resolve() if args.runtime_output else RUNTIME_WEIGHTS_PATH
     if runtime_path.exists():
@@ -588,6 +1304,7 @@ def cmd_status(args):
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )[:5]
+    recent_evals = sorted(EVAL_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:5] if EVAL_DIR.exists() else []
 
     print("\nRecent traces:")
     if recent_traces:
@@ -599,6 +1316,13 @@ def cmd_status(args):
     print("\nRecent checkpoints:")
     if recent_ckpts:
         for path in recent_ckpts:
+            print(f"  {path.name}")
+    else:
+        print("  none")
+
+    print("\nRecent evals:")
+    if recent_evals:
+        for path in recent_evals:
             print(f"  {path.name}")
     else:
         print("  none")
@@ -623,14 +1347,44 @@ def build_parser():
     record.set_defaults(launch_webots=True)
     record.set_defaults(func=cmd_record)
 
+    submission_eval = subparsers.add_parser(
+        "submission-eval",
+        help="Evaluate the submission controller stack on soccer_solo.wbt with randomized ball starts.",
+    )
+    submission_eval.add_argument("--name", help="Run name for traces and summary files.")
+    submission_eval.add_argument("--episodes", type=int, default=20)
+    submission_eval.add_argument("--seed", type=int, default=7)
+    submission_eval.add_argument("--x-min", type=float, default=-1.25)
+    submission_eval.add_argument("--x-max", type=float, default=1.50)
+    submission_eval.add_argument("--y-min", type=float, default=-1.50)
+    submission_eval.add_argument("--y-max", type=float, default=1.50)
+    submission_eval.add_argument("--fixed-ball-x", type=float, help="Use one fixed ball x coordinate for every episode.")
+    submission_eval.add_argument("--fixed-ball-y", type=float, help="Use one fixed ball y coordinate for every episode.")
+    submission_eval.add_argument("--min-robot-dist", type=float, default=0.35, help="Reject ball starts too close to the robot's fixed start pose.")
+    submission_eval.add_argument("--max-steps", type=int, default=18000)
+    submission_eval.add_argument("--eval-dir", type=Path, default=EVAL_DIR)
+    submission_eval.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    submission_eval.add_argument("--output", type=Path, help="Summary JSON path.")
+    submission_eval.add_argument("--weights", type=Path, help="Optional runtime .npz actor weights file to use.")
+    submission_eval.add_argument("--residual-blend", type=float, help="Optional RL_RESIDUAL_BLEND override.")
+    submission_eval.add_argument("--visualizer", action="store_true", help="Keep the live visualizer enabled during evaluation.")
+    submission_eval.add_argument("--world", default=str(DEFAULT_WORLD), help="Webots world to launch.")
+    submission_eval.add_argument("--webots-bin", help="Path to the Webots executable.")
+    submission_eval.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast", help="Webots run mode.")
+    submission_eval.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch mode.")
+    submission_eval.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during evaluation.")
+    submission_eval.add_argument("--dry-run", action="store_true", help="Print launch commands without running them.")
+    submission_eval.set_defaults(func=cmd_submission_eval)
+
     deepbots_record = subparsers.add_parser("deepbots-record", help="Run the deepbots world with live policy actions and transition logging.")
     deepbots_record.add_argument("name", nargs="?", help="Trace run name.")
     deepbots_record.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
-    deepbots_record.add_argument("--policy", choices=("actor", "random", "sac"), default="actor", help="Policy source for live actions.")
+    deepbots_record.add_argument("--policy", choices=("actor", "bootstrap", "expert", "random", "sac"), default="actor", help="Policy source for live actions.")
     deepbots_record.add_argument("--weights", type=Path, help="Runtime .npz actor weights for --policy actor.")
     deepbots_record.add_argument("--model", type=Path, help="SB3 SAC .zip model for --policy sac.")
     deepbots_record.add_argument("--phase", type=int, default=2, help="Curriculum phase used by the deepbots reset sampler.")
-    deepbots_record.add_argument("--max-episode-steps", type=int, default=1800)
+    deepbots_record.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_record.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_record.add_argument("--seed", type=int, default=7)
     deepbots_record.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_record.add_argument("--webots-bin", help="Path to the Webots executable.")
@@ -640,6 +1394,30 @@ def build_parser():
     deepbots_record.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_record.set_defaults(launch_webots=True)
     deepbots_record.set_defaults(func=cmd_deepbots_record)
+
+    deepbots_eval = subparsers.add_parser("deepbots-eval", help="Evaluate a policy for a finite number of deepbots episodes.")
+    deepbots_eval.add_argument("--name", help="Run name for the eval summary.")
+    deepbots_eval.add_argument("--policy", choices=("actor", "bootstrap", "expert", "sac"), default="actor")
+    deepbots_eval.add_argument("--weights", type=Path, help="Runtime .npz actor weights for --policy actor.")
+    deepbots_eval.add_argument("--model", type=Path, help="SB3 SAC .zip model for --policy sac.")
+    deepbots_eval.add_argument("--episodes", type=int, default=50)
+    deepbots_eval.add_argument("--eval-dir", type=Path, default=EVAL_DIR)
+    deepbots_eval.add_argument("--output", type=Path, help="Eval summary JSON path.")
+    deepbots_eval.add_argument("--trace", action="store_true", help="Also write per-step transition trace for eval episodes.")
+    deepbots_eval.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    deepbots_eval.add_argument("--phase", type=int, default=2)
+    deepbots_eval.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_eval.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
+    deepbots_eval.add_argument("--seed", type=int, default=7)
+    deepbots_eval.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
+    deepbots_eval.add_argument("--webots-bin", help="Path to the Webots executable.")
+    deepbots_eval.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast")
+    deepbots_eval.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch mode.")
+    deepbots_eval.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during evaluation.")
+    deepbots_eval.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
+    deepbots_eval.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
+    deepbots_eval.set_defaults(launch_webots=True)
+    deepbots_eval.set_defaults(func=cmd_deepbots_eval)
 
     deepbots_train = subparsers.add_parser("deepbots-train", help="Train SAC inside Webots through the deepbots controller.")
     deepbots_train.add_argument("--name", help="Run name for the SAC model and trace.")
@@ -656,8 +1434,13 @@ def build_parser():
     deepbots_train.add_argument("--warm-start", choices=("bootstrap", "runtime", "none"), default="bootstrap", help="Initialize SAC actor from the embedded/runtime actor before online learning.")
     deepbots_train.add_argument("--warm-start-weights", type=Path, help="Specific runtime .npz actor weights for SAC warm-start.")
     deepbots_train.add_argument("--sac-log-std-init", type=float, default=-1.2, help="Initial SAC log standard deviation when warm-starting the actor.")
+    deepbots_train.add_argument("--demo-traces", nargs="*", type=Path, help="Expert/demo JSONL traces to prefill the SAC replay buffer.")
+    deepbots_train.add_argument("--demo-limit", type=int, default=0, help="Maximum demo transitions to prefill; 0 means all.")
+    deepbots_train.add_argument("--ent-coef", default=None, help="SAC entropy coefficient, e.g. auto, 0.02, or 0.005.")
+    deepbots_train.add_argument("--gradient-steps", type=int, default=1, help="Gradient updates per environment step.")
     deepbots_train.add_argument("--phase", type=int, default=2)
-    deepbots_train.add_argument("--max-episode-steps", type=int, default=1800)
+    deepbots_train.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_train.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_train.add_argument("--seed", type=int, default=7)
     deepbots_train.add_argument("--tensorboard-dir", type=Path)
     deepbots_train.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
@@ -685,6 +1468,7 @@ def build_parser():
         sub.add_argument("--batch-size", type=int, default=256)
         sub.add_argument("--lr", type=float, default=3e-4)
         sub.add_argument("--gamma", type=float, default=0.995)
+        sub.add_argument("--weighting", choices=("advantage", "uniform"), default="advantage")
         sub.add_argument("--device", default="cpu")
         sub.set_defaults(func=func)
 
@@ -715,6 +1499,23 @@ def build_parser():
     filter_success.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
     filter_success.add_argument("--output", type=Path, help="Filtered JSONL output path.")
     filter_success.set_defaults(func=cmd_filter_success)
+
+    trace_summary = subparsers.add_parser("trace-summary", help="Summarize trace success rates and episode lengths.")
+    trace_summary.add_argument("traces", nargs="*", help="Trace files, directories, or glob patterns. Default: tmp/rl_traces/*.jsonl")
+    trace_summary.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    trace_summary.set_defaults(func=cmd_trace_summary)
+
+    localization_summary = subparsers.add_parser(
+        "localization-summary",
+        help="Compute localization robustness metrics from transition traces.",
+    )
+    localization_summary.add_argument("traces", nargs="*", help="Trace files, directories, or glob patterns. Default: tmp/rl_traces/*.jsonl")
+    localization_summary.add_argument("--name", help="Run name for metrics output.")
+    localization_summary.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    localization_summary.add_argument("--metrics-dir", type=Path, default=LOCALIZATION_METRICS_DIR)
+    localization_summary.add_argument("--output", type=Path, help="Metrics JSON output path.")
+    localization_summary.add_argument("--fail-on-gate", action="store_true", help="Return non-zero if localization acceptance gates fail.")
+    localization_summary.set_defaults(func=cmd_localization_summary)
 
     return parser
 

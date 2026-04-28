@@ -1,6 +1,7 @@
 import json
 import math
 import queue
+import signal
 import sys
 import threading
 
@@ -32,11 +33,15 @@ class LocalizationVisualizer:
         self.snapshot_queue = queue.Queue()
         self.latest_snapshot = None
         self.dynamic_artists = []
+        self.stdin_closed = False
+        self.shutdown_requested = False
+        self.shutting_down = False
 
         self.fig, self.ax = plt.subplots(figsize=(11, 7))
         self.fig.canvas.manager.set_window_title("Webots Localization Visualizer")
         self._draw_field()
         self._draw_legend()
+        self._install_signal_handlers()
 
         reader = threading.Thread(target=self._stdin_reader, daemon=True)
         reader.start()
@@ -45,6 +50,19 @@ class LocalizationVisualizer:
         self.timer.add_callback(self._tick)
         self.timer.start()
         self.fig.canvas.mpl_connect("close_event", self._on_close)
+
+    def _install_signal_handlers(self):
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._handle_signal)
+            except (ValueError, OSError):
+                continue
+
+    def _handle_signal(self, _signum, _frame):
+        self.shutdown_requested = True
 
     def _draw_field(self):
         self.ax.set_aspect("equal")
@@ -119,7 +137,8 @@ class LocalizationVisualizer:
     def _draw_legend(self):
         legend_items = [
             Line2D([0], [0], marker="o", color="w", label="Actual robot", markerfacecolor="#2ca02c", markersize=9),
-            Line2D([0], [0], marker="o", color="w", label="Estimated robot", markerfacecolor="#d62728", markersize=9),
+            Line2D([0], [0], marker="o", color="w", label="Fused robot", markerfacecolor="#d62728", markersize=9),
+            Line2D([0], [0], marker="o", color="w", label="Raw localizer", markerfacecolor="#1f77b4", markersize=9),
             Line2D([0], [0], marker="o", color="w", label="Actual ball", markerfacecolor="#ffdd57", markersize=9),
             Line2D([0], [0], marker="o", color="w", label="Estimated ball", markerfacecolor="#ff7f0e", markersize=9),
             Line2D([0], [0], marker=".", color="#666666", label="Pose hypotheses", markersize=8, linestyle="None"),
@@ -140,12 +159,18 @@ class LocalizationVisualizer:
             except json.JSONDecodeError:
                 continue
 
+            if payload.get("type") == "shutdown":
+                self.shutdown_requested = True
+                break
+
             while True:
                 try:
                     self.snapshot_queue.get_nowait()
                 except queue.Empty:
                     break
             self.snapshot_queue.put(payload)
+        self.stdin_closed = True
+        self.shutdown_requested = True
 
     def _tick(self):
         updated = False
@@ -157,6 +182,9 @@ class LocalizationVisualizer:
                 break
         if updated and self.latest_snapshot is not None:
             self._render_snapshot(self.latest_snapshot)
+        if self.shutdown_requested and self.snapshot_queue.empty():
+            self._shutdown()
+            return False
         return True
 
     def _clear_dynamic_artists(self):
@@ -244,18 +272,49 @@ class LocalizationVisualizer:
         self._draw_ball(snapshot.get("actual_ball"), color="#ffdd57", label="ball true", zorder=7)
         self._draw_ball(snapshot.get("estimated_ball"), color="#ff7f0e", label="ball est", zorder=8)
         self._draw_pose(snapshot.get("actual_pose"), color="#2ca02c", label="robot true", alpha=0.9, zorder=8)
-        self._draw_pose(snapshot.get("estimated_pose"), color="#d62728", label="robot est", alpha=0.9, zorder=9)
+        self._draw_pose(snapshot.get("localizer_pose"), color="#1f77b4", label="localizer", alpha=0.65, zorder=8)
+        self._draw_pose(snapshot.get("estimated_pose"), color="#d62728", label="fused", alpha=0.9, zorder=9)
 
         state = snapshot.get("state", "UNKNOWN")
         confidence = snapshot.get("confidence", 0.0)
-        self.ax.set_title(f"State: {state} | Localization confidence: {confidence:.2f}")
+        localization = snapshot.get("localization") or {}
+        fused = localization.get("fused") or {}
+        localizer = localization.get("localizer") or {}
+        landmark = localization.get("landmark_bin", "unknown")
+        trust = localization.get("pose_correction_trust", 0.0)
+        ess = localization.get("effective_sample_size_norm", 0.0)
+        fused_error = fused.get("pos_error")
+        raw_error = localizer.get("pos_error")
+        fused_text = "?" if fused_error is None else f"{fused_error:.2f}m"
+        raw_text = "?" if raw_error is None else f"{raw_error:.2f}m"
+        self.ax.set_title(
+            f"State: {state} | bin={landmark} | conf={confidence:.2f} "
+            f"trust={trust:.2f} ESS={ess:.2f} | fused err={fused_text} raw err={raw_text}"
+        )
         self.fig.canvas.draw_idle()
 
+    def _shutdown(self):
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        plt.close(self.fig)
+
     def _on_close(self, _event):
-        plt.close("all")
+        self.shutting_down = True
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
 
     def run(self):
-        plt.show()
+        try:
+            plt.show()
+        finally:
+            self._shutdown()
 
 
 def main():

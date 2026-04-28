@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import numpy as np
 from controller import Robot, DistanceSensor, Motor, Compass, GPS
 from controller import Supervisor
@@ -8,6 +10,10 @@ from starter_controller import StudentController
 MIN_VELOCITY = -6.25
 MAX_VELOCITY = 6.25
 MAX_BOXES = 10
+GOAL_X = 4.5
+GOAL_HALF_WIDTH = 0.8
+BALL_Z = 0.07
+DEFAULT_LOCAL_EVAL_MAX_STEPS = 18000
 
 
 # Define the robot class
@@ -26,6 +32,7 @@ class TurtleBotController:
         # self.supervisor = Supervisor()
         self.ego_robot_node = self.robot.getFromDef(self.ego_id)
         self.opponent_robot_node = self.robot.getFromDef(self.opponent_id)
+        self.ball_node = self.robot.getFromDef("BALL")
 
         # Get motors (assuming left and right motors are available)
         self.left_motor = self.robot.getDevice("left wheel motor")
@@ -58,6 +65,85 @@ class TurtleBotController:
         self.prev_rotation = None
 
         self.student_controller = StudentController()
+        self.local_eval = self._load_local_eval_config()
+        self.local_eval_got_to_ball = False
+        self._configure_local_eval()
+
+    def _load_local_eval_config(self):
+        ball_x = os.environ.get("WEBOTS_SUBMISSION_BALL_X")
+        ball_y = os.environ.get("WEBOTS_SUBMISSION_BALL_Y")
+        summary_path = os.environ.get("WEBOTS_SUBMISSION_SUMMARY_PATH")
+        label = os.environ.get("WEBOTS_SUBMISSION_LABEL", "")
+        max_steps_raw = os.environ.get("WEBOTS_SUBMISSION_MAX_STEPS")
+        if ball_x is None and ball_y is None and summary_path is None and max_steps_raw is None and not label:
+            return None
+        if ball_x is None or ball_y is None:
+            raise ValueError("WEBOTS_SUBMISSION_BALL_X and WEBOTS_SUBMISSION_BALL_Y must be provided together.")
+        return {
+            "ball": (float(ball_x), float(ball_y)),
+            "summary_path": summary_path,
+            "label": label,
+            "max_steps": int(max_steps_raw or DEFAULT_LOCAL_EVAL_MAX_STEPS),
+        }
+
+    def _configure_local_eval(self):
+        if self.local_eval is None or self.ball_node is None:
+            return
+
+        ball_x, ball_y = self.local_eval["ball"]
+        self.ball_node.getField("translation").setSFVec3f([ball_x, ball_y, BALL_Z])
+        self.ball_node.resetPhysics()
+        self.ego_robot_node.resetPhysics()
+        self.robot.simulationResetPhysics()
+        self.left_motor.setVelocity(0.0)
+        self.right_motor.setVelocity(0.0)
+        self.robot.step(self.time_step)
+
+    def _local_eval_status(self, step_index):
+        if self.local_eval is None:
+            return None
+
+        robot_pose = self.provide_pose()
+        ball_position = self.provide_ball_position()
+        if np.linalg.norm(np.array(robot_pose[:2]) - np.array(ball_position)) <= 0.5:
+            self.local_eval_got_to_ball = True
+
+        if ball_position[0] > GOAL_X and abs(ball_position[1]) <= GOAL_HALF_WIDTH:
+            outcome = "correct_goal"
+        elif ball_position[0] < -GOAL_X and abs(ball_position[1]) <= GOAL_HALF_WIDTH:
+            outcome = "wrong_goal"
+        elif step_index >= self.local_eval["max_steps"]:
+            outcome = "timeout"
+        else:
+            return None
+
+        return {
+            "label": self.local_eval["label"],
+            "outcome": outcome,
+            "step": int(step_index),
+            "got_to_ball": bool(self.local_eval_got_to_ball),
+            "ball_position": [float(ball_position[0]), float(ball_position[1])],
+            "robot_pose": [float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])],
+            "ball_init": [float(self.local_eval["ball"][0]), float(self.local_eval["ball"][1])],
+        }
+
+    def _finish_local_eval(self, status):
+        self.left_motor.setVelocity(0.0)
+        self.right_motor.setVelocity(0.0)
+
+        summary_path = self.local_eval.get("summary_path") if self.local_eval is not None else None
+        if summary_path:
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            with open(summary_path, "w", encoding="utf-8") as handle:
+                json.dump(status, handle, indent=2)
+
+        print(
+            "submission_eval "
+            f"label={status['label']} outcome={status['outcome']} "
+            f"step={status['step']} ball=({status['ball_position'][0]:.3f},{status['ball_position'][1]:.3f})"
+        )
+        self.student_controller.close()
+        self.robot.simulationQuit(0)
 
     def provide_compass(self):
         values = self.compass.getValues()
@@ -140,13 +226,11 @@ class TurtleBotController:
         return None
 
     def provide_ball_observation(self):
-        ball = self.robot.getFromDef("BALL")
-        position = ball.getField("translation").getSFVec3f()[:2]
+        position = self.ball_node.getField("translation").getSFVec3f()[:2]
         return self.get_obs(position)
 
     def provide_ball_position(self):
-        ball = self.robot.getFromDef("BALL")
-        return ball.getField("translation").getSFVec3f()[:2]
+        return self.ball_node.getField("translation").getSFVec3f()[:2]
 
     def provide_goal_observations(self):
 
@@ -219,36 +303,46 @@ class TurtleBotController:
         """
 
         print("Starting run loop for %s" % self.ego_id)
-        while self.robot.step(self.time_step) != -1:
-            # Pack sensor values for student controller
-            sensors = {
-                "ball": self.provide_ball_observation(),  # ball observation or None
-                "goal": self.provide_goal_observations(),  # list of goal sightings
-                "center_circle": self.provide_center_observation(),
-                "penalty_cross": self.provide_cross_observations(),
-                "corners": self.provide_corner_observations(),
-                "opponent": self.provide_opponent_observation(),
-                "odometry": self.provide_odometry(),
-                "debug_truth": {
-                    "robot_pose": self.provide_pose(),
-                    "ball_position": self.provide_ball_position(),
-                },
-            }
+        step_index = 0
+        try:
+            while self.robot.step(self.time_step) != -1:
+                step_index += 1
+                status = self._local_eval_status(step_index)
+                if status is not None:
+                    self._finish_local_eval(status)
+                    return
 
-            # Get control values from student controller
-            controls = self.student_controller.step(sensors)
-            lwhl = controls.get("left_motor", 0.0)
-            rwhl = controls.get("right_motor", 0.0)
+                # Pack sensor values for student controller
+                sensors = {
+                    "ball": self.provide_ball_observation(),  # ball observation or None
+                    "goal": self.provide_goal_observations(),  # list of goal sightings
+                    "center_circle": self.provide_center_observation(),
+                    "penalty_cross": self.provide_cross_observations(),
+                    "corners": self.provide_corner_observations(),
+                    "opponent": self.provide_opponent_observation(),
+                    "odometry": self.provide_odometry(),
+                    "debug_truth": {
+                        "robot_pose": self.provide_pose(),
+                        "ball_position": self.provide_ball_position(),
+                    },
+                }
 
-            # Apply noise to control and clip to remain in bounds
-            lwhl += np.random.normal(0, self._control_noise_pct * abs(lwhl))
-            rwhl += np.random.normal(0, self._control_noise_pct * abs(rwhl))
-            lwhl = self.clip_control(lwhl)
-            rwhl = self.clip_control(rwhl)
+                # Get control values from student controller
+                controls = self.student_controller.step(sensors)
+                lwhl = controls.get("left_motor", 0.0)
+                rwhl = controls.get("right_motor", 0.0)
 
-            # Set control
-            self.left_motor.setVelocity(lwhl)
-            self.right_motor.setVelocity(rwhl)
+                # Apply noise to control and clip to remain in bounds
+                lwhl += np.random.normal(0, self._control_noise_pct * abs(lwhl))
+                rwhl += np.random.normal(0, self._control_noise_pct * abs(rwhl))
+                lwhl = self.clip_control(lwhl)
+                rwhl = self.clip_control(rwhl)
+
+                # Set control
+                self.left_motor.setVelocity(lwhl)
+                self.right_motor.setVelocity(rwhl)
+        finally:
+            self.student_controller.close()
 
 
 # Create a controller instance and run it

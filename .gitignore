@@ -5,5 +5,9 @@ __pycache__/
 final_project/worlds/.*.wbproj
 tmp/rl_traces/
 tmp/rl_checkpoints/
+tmp/rl_eval/
+tmp/localization_metrics/
 /final_project/controllers/robot_one_controller/rl_policy_weights.npz
+/final_project/controllers/rl_training_controller/config.ini
+/final_project/controllers/rl_training_controller/runtime.ini
 /deepbots/
