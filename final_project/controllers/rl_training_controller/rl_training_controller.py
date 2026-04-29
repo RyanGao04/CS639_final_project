@@ -120,6 +120,29 @@ def _env_float(name, default):
         return default
 
 
+def _flatten_scalar_info(info, prefix=""):
+    scalars = {}
+    if not isinstance(info, dict):
+        return scalars
+
+    for key, value in info.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            scalars.update(_flatten_scalar_info(value, name))
+            continue
+        try:
+            array = np.asarray(value)
+        except Exception:
+            continue
+        if array.shape != ():
+            continue
+        try:
+            scalars[name] = float(array)
+        except (TypeError, ValueError):
+            continue
+    return scalars
+
+
 def _env_bool(name, default=False):
     value = os.environ.get(name)
     if value is None:
@@ -1187,11 +1210,7 @@ def run_serl_training(env):
             break
         agent, info = _serl_update(agent, demo_buffer, jax, jnp, _tree_to_jax, total_update_batch_size, utd_ratio)
         if update_step == 1 or update_step % log_period == 0:
-            scalar_info = {
-                key: float(np.asarray(value))
-                for key, value in info.items()
-                if np.asarray(value).shape == ()
-            }
+            scalar_info = _flatten_scalar_info(info)
             print(f"serl pretrain update={update_step}: {json.dumps(scalar_info, sort_keys=True)}")
 
     rng = jax.random.PRNGKey(_env_int("RL_DEEPBOTS_SEED", 7) + 1009)
@@ -1257,11 +1276,7 @@ def run_serl_training(env):
             obs = next_obs
 
         if step == 1 or step % log_period == 0:
-            scalar_info = {
-                key: float(np.asarray(value))
-                for key, value in train_info.items()
-                if np.asarray(value).shape == ()
-            }
+            scalar_info = _flatten_scalar_info(train_info)
             print(
                 f"serl step={step}/{total_steps} online_replay={len(replay_buffer)} "
                 f"demo_replay={0 if demo_buffer is None else len(demo_buffer)} "

@@ -16,6 +16,29 @@ DEFAULT_SERL_ROOT = Path(os.environ.get("SERL_ROOT", "~/serl")).expanduser()
 DEFAULT_RUNTIME_OUTPUT = CONTROLLER_DIR / "e2e_rl_policy_weights.npz"
 
 
+def _flatten_scalar_info(info, prefix=""):
+    scalars = {}
+    if not isinstance(info, dict):
+        return scalars
+
+    for key, value in info.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            scalars.update(_flatten_scalar_info(value, name))
+            continue
+        try:
+            array = np.asarray(value)
+        except Exception:
+            continue
+        if array.shape != ():
+            continue
+        try:
+            scalars[name] = float(array)
+        except (TypeError, ValueError):
+            continue
+    return scalars
+
+
 def _import_runtime_controller():
     sys.path.insert(0, str(CONTROLLER_DIR))
     from starter_controller import E2E_INPUT_DIM
@@ -279,11 +302,7 @@ def main():
         batch = _tree_to_jax(jax, jnp, batch)
         agent, info = agent.update_high_utd(batch, utd_ratio=args.utd_ratio)
         if step == 1 or step % args.log_period == 0:
-            scalar_info = {
-                key: float(np.asarray(value))
-                for key, value in info.items()
-                if np.asarray(value).shape == ()
-            }
+            scalar_info = _flatten_scalar_info(info)
             print(f"step {step}: {json.dumps(scalar_info, sort_keys=True)}")
 
     params = unfreeze(agent.state.params)
