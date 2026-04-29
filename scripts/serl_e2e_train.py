@@ -195,8 +195,25 @@ def _insert_transitions(replay_buffer, transitions):
         replay_buffer.insert(item)
 
 
+def _actor_param_tree(params):
+    for key in ("actor", "modules_actor"):
+        actor = params.get(key)
+        if isinstance(actor, dict):
+            return actor
+    candidates = [
+        key
+        for key, value in params.items()
+        if isinstance(value, dict) and key.endswith("actor")
+    ]
+    raise RuntimeError(
+        "Could not find SERL actor params. "
+        f"Available top-level param keys: {sorted(params.keys())}; "
+        f"actor-like keys: {candidates}"
+    )
+
+
 def _actor_arrays_from_params(params, feature_dim):
-    actor = params["actor"]
+    actor = _actor_param_tree(params)
     mlp = None
     for value in actor.values():
         if not isinstance(value, dict):
