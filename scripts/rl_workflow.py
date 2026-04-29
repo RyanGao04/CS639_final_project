@@ -13,7 +13,6 @@ import subprocess
 import sys
 
 import numpy as np
-import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +246,8 @@ def _extract_arrays(state_dict):
 
 
 def _load_checkpoint_arrays(checkpoint_path):
+    import torch
+
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
@@ -1574,6 +1575,7 @@ def build_parser():
     deepbots_teleop.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
     deepbots_teleop.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_teleop.add_argument("--seed", type=int, default=7)
+    deepbots_teleop.add_argument("--python", help="Python interpreter for the Webots controller; should have deepbots/SERL dependencies.")
     deepbots_teleop.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_teleop.add_argument("--webots-bin", help="Path to the Webots executable.")
     deepbots_teleop.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="realtime", help="Webots run mode.")

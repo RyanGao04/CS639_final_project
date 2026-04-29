@@ -3,6 +3,7 @@
 
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -13,6 +14,18 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "scripts" / "rl_workflow.py"
 TRACE_DIR = ROOT / "tmp" / "rl_traces"
 DEEPBOTS_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo_deepbots.wbt"
+
+
+def _default_controller_python():
+    serl_python = os.environ.get("SERL_PYTHON")
+    if serl_python:
+        return serl_python
+
+    local_serl_python = Path("/opt/anaconda3/envs/serl-cs639/bin/python")
+    if local_serl_python.exists():
+        return str(local_serl_python)
+
+    return sys.executable
 
 
 def _timestamp_name():
@@ -27,6 +40,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("name", nargs="?", default=_timestamp_name(), help="Trace run name.")
     parser.add_argument("--python", default=sys.executable, help="Python interpreter used for rl_workflow.py.")
+    parser.add_argument("--controller-python", default=_default_controller_python(), help="Python interpreter Webots uses for the deepbots controller.")
     parser.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
     parser.add_argument("--phase", type=int, default=3, help="Curriculum/reset phase. Phase 3 uses assignment-style starts.")
     parser.add_argument("--max-episode-steps", type=int, default=6000)
@@ -56,6 +70,8 @@ def main():
         str(args.world),
         "--webots-mode",
         args.webots_mode,
+        "--python",
+        args.controller_python,
     ]
     if args.webots_bin:
         cmd.extend(["--webots-bin", args.webots_bin])
