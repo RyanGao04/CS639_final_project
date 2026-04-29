@@ -29,6 +29,9 @@ RL_TURN_SCALE = 3.2
 VISUALIZER_DEFAULT_ENABLED = True
 OBSERVATION_FOV = math.pi / 2.0
 PLANNER_BALL_MEMORY_STEPS = 6000
+PLANNER_ARENA_PADDING = 0.18
+PLANNER_BOUNDARY_EPS = 0.03
+SEARCH_SWEEP_STEPS = 190
 
 
 def clamp(value, low, high):
@@ -128,6 +131,35 @@ def clip_to_arena(point, padding=0.05):
 
 def clip_ball_position(point, padding=0.05):
     return clip_to_arena(point, padding=padding)
+
+
+def clip_to_planner_bounds(point, padding=PLANNER_ARENA_PADDING):
+    return clip_to_arena(point, padding=padding)
+
+
+def ball_outside_field(point, margin=PLANNER_BOUNDARY_EPS):
+    return abs(point[0]) > FIELD_X_HALF + margin or abs(point[1]) > FIELD_Y_HALF + margin
+
+
+def ball_near_field_boundary(point, margin=0.45):
+    return min(FIELD_X_HALF - abs(point[0]), FIELD_Y_HALF - abs(point[1])) < margin
+
+
+def ball_uses_arena_planner(point):
+    return ball_outside_field(point) or ball_near_field_boundary(point)
+
+
+def clip_to_planner_region(point, ball, padding=PLANNER_ARENA_PADDING):
+    if ball_uses_arena_planner(ball):
+        return clip_to_arena(point, padding=padding)
+    return clip_to_field(point, padding=padding)
+
+
+def planner_wall_margin(point):
+    field_margin = min(FIELD_X_HALF - abs(point[0]), FIELD_Y_HALF - abs(point[1]))
+    if field_margin >= 0.0:
+        return field_margin
+    return min(ARENA_X_HALF - abs(point[0]), ARENA_Y_HALF - abs(point[1]))
 
 
 @dataclass
@@ -1952,6 +1984,14 @@ class StudentController:
             pose = self.fused_pose
             ball_rel = self.ball_tracker.relative_ball(pose)
             if ball_rel is not None:
+                if self._needs_search_ball_alignment(ball_rel):
+                    turn = clamp(2.85 * ball_rel[1], -2.8, 2.8)
+                    self.last_motion_plan = {
+                        "mode": "search_acquire_align",
+                        "target": [float(ball_position[0]), float(ball_position[1])],
+                        "path": self._planner_path_payload([ball_position]),
+                    }
+                    return self._wheel_command(0.0, turn)
                 return self._action_to_control(
                     self._geometric_rl_prior(
                         {
@@ -1970,18 +2010,24 @@ class StudentController:
             forward = 0.0 if self.last_seen_ball_rel[0] < 1.0 else 0.7 if abs(self.last_seen_ball_rel[1]) < 0.40 else 0.0
             return self._wheel_command(forward, turn)
 
-        sweep_phase = self.state_age // 120
-        if sweep_phase == 0:
+        first_sweep = SEARCH_SWEEP_STEPS
+        full_sweep = 2 * SEARCH_SWEEP_STEPS
+        if self.state_age < first_sweep:
             self.search_direction = 1.0
             forward = 0.0
             turn = 2.8
-        elif sweep_phase == 1:
+        elif self.state_age < first_sweep + full_sweep:
             self.search_direction = -1.0
             forward = 0.0
             turn = -2.8
+        elif self.state_age < first_sweep + 2 * full_sweep:
+            self.search_direction = 1.0
+            forward = 0.0
+            turn = 2.8
         else:
+            sweep_phase = (self.state_age - first_sweep - 2 * full_sweep) // SEARCH_SWEEP_STEPS
             self.search_direction = -1.0 if sweep_phase % 2 == 0 else 1.0
-            forward = 0.8 if self.localizer.confidence > 0.25 else 0.0
+            forward = 0.65 if self.localizer.confidence > 0.30 else 0.0
             turn = 1.9 * self.search_direction
         return self._wheel_command(forward, turn)
 
@@ -2135,6 +2181,17 @@ class StudentController:
         if self.ball_tracker.confidence >= 0.25 and self.ball_tracker.age <= max(max_age, 80):
             return True
         return False
+
+    def _needs_search_ball_alignment(self, ball_rel):
+        if ball_rel is None or self.state != "SEARCH_BALL":
+            return False
+        ball_dist, ball_angle = ball_rel
+        if ball_dist < 1.20:
+            return False
+        if ball_dist > 3.00:
+            return False
+        angle_gate = 0.30 if ball_dist < 2.60 else 0.36
+        return abs(ball_angle) > angle_gate
 
     def extract_rl_features(self, pose, sensors):
         ball_visible = 1.0 if sensors.get("ball") is not None else 0.0
@@ -2313,10 +2370,22 @@ class StudentController:
         return forward, turn, target_dist, target_angle
 
     def _planner_goal_target(self, ball):
-        if ball[0] > 0.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18:
+        target_x = 4.95
+        boundary_ball = ball_outside_field(ball)
+        if boundary_ball and ball[0] > FIELD_X_HALF - 0.05 and GOAL_HALF_WIDTH - 0.25 < abs(ball[1]) < 1.20:
+            target_x = 4.80
+            target_y = 0.0
+        elif ball[0] > 0.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18:
             target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.18, GOAL_HALF_WIDTH - 0.18)
+        elif boundary_ball and ball[0] > 3.55 and abs(ball[1]) > 1.20:
+            side = 1.0 if ball[1] >= 0.0 else -1.0
+            inward_step = 0.62 if ball[0] > 4.15 else 0.38
+            target_y = side * max(0.80, abs(ball[1]) - inward_step)
         elif ball[0] > 3.55:
             target_y = clamp(0.18 * ball[1], -0.12, 0.12)
+        elif boundary_ball and abs(ball[1]) > FIELD_Y_HALF - 0.20 and ball[0] < 3.35:
+            side = 1.0 if ball[1] >= 0.0 else -1.0
+            target_y = side * (FIELD_Y_HALF - 0.36)
         elif abs(ball[1]) > 1.35:
             target_y = 0.0
         elif abs(ball[1]) > GOAL_HALF_WIDTH - 0.10 and ball[0] < 2.80:
@@ -2325,7 +2394,7 @@ class StudentController:
             target_y = 0.0
         else:
             target_y = clamp(0.30 * ball[1], -0.24, 0.24)
-        return (4.95, target_y)
+        return (target_x, target_y)
 
     def _segment_point_clearance(self, start, end, point):
         sx, sy = start
@@ -2359,18 +2428,20 @@ class StudentController:
     def _path_wall_margin(self, path):
         if not path:
             return 0.0
-        return min(
-            min(FIELD_X_HALF - abs(point[0]), FIELD_Y_HALF - abs(point[1]))
-            for point in path
-        )
+        return min(planner_wall_margin(point) for point in path)
 
     def _planner_staging_point(self, ball, push_unit, staging_offset):
         desired_angle = math.atan2(-push_unit[1], -push_unit[0])
-        padding = 0.18
-        min_x = -FIELD_X_HALF + padding
-        max_x = FIELD_X_HALF - padding
-        min_y = -FIELD_Y_HALF + padding
-        max_y = FIELD_Y_HALF - padding
+        boundary_ball = ball_uses_arena_planner(ball)
+        padding = PLANNER_ARENA_PADDING if boundary_ball else 0.18
+        if boundary_ball and abs(ball[1]) > FIELD_Y_HALF - 0.22:
+            padding = max(padding, 0.30)
+        bounds_x = ARENA_X_HALF if boundary_ball else FIELD_X_HALF
+        bounds_y = ARENA_Y_HALF if boundary_ball else FIELD_Y_HALF
+        min_x = -bounds_x + padding
+        max_x = bounds_x - padding
+        min_y = -bounds_y + padding
+        max_y = bounds_y - padding
         radii = (
             max(0.68, staging_offset),
             max(0.78, staging_offset + 0.10),
@@ -2416,10 +2487,7 @@ class StudentController:
                     from_ball_x * (-push_unit[1])
                     + from_ball_y * push_unit[0]
                 )
-                wall_margin = min(
-                    FIELD_X_HALF - abs(candidate[0]),
-                    FIELD_Y_HALF - abs(candidate[1]),
-                )
+                wall_margin = planner_wall_margin(candidate)
                 score = (
                     0.72 * abs(delta)
                     + 0.72 * lateral_error
@@ -2440,7 +2508,7 @@ class StudentController:
             ball[0] - staging_offset * push_unit[0],
             ball[1] - staging_offset * push_unit[1],
         )
-        fallback = clip_to_field(fallback, padding=padding)
+        fallback = clip_to_planner_region(fallback, ball, padding=padding)
         from_ball_x = fallback[0] - ball[0]
         from_ball_y = fallback[1] - ball[1]
         fallback_dist = math.hypot(from_ball_x, from_ball_y)
@@ -2450,7 +2518,7 @@ class StudentController:
                 ball[0] + 0.62 * math.cos(angle),
                 ball[1] + 0.62 * math.sin(angle),
             )
-            fallback = clip_to_field(fallback, padding=padding)
+            fallback = clip_to_planner_region(fallback, ball, padding=padding)
         return fallback
 
     def _planner_arc_path(self, pose, ball, staging, push_unit, sign, radius):
@@ -2471,7 +2539,7 @@ class StudentController:
                 ball[0] + radius * math.cos(angle),
                 ball[1] + radius * math.sin(angle),
             )
-            point = clip_to_field(point, padding=0.18)
+            point = clip_to_planner_region(point, ball, padding=PLANNER_ARENA_PADDING if ball_uses_arena_planner(ball) else 0.18)
             if distance(point, ball) >= 0.52:
                 points.append(point)
 
@@ -2536,6 +2604,8 @@ class StudentController:
             orbit_radius = 0.66
         if abs(ball[0]) > FIELD_X_HALF - 0.85:
             orbit_radius = min(orbit_radius, 0.58)
+        if ball_outside_field(ball) and planner_wall_margin(ball) < 0.55:
+            orbit_radius = min(orbit_radius, 0.56)
         ball_safety = 0.44 if robot_ball_radius < 0.60 else 0.50
         orbit_radius = max(
             orbit_radius,
@@ -2599,7 +2669,7 @@ class StudentController:
             self.last_motion_plan = {}
             return None
 
-        ball = clip_to_field(ball, padding=0.08)
+        ball = clip_ball_position(ball, padding=0.08) if ball_outside_field(ball) else clip_to_field(ball, padding=0.08)
         direct_goal_lane = ball[0] > 0.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18
         goal_target = self._planner_goal_target(ball)
         target_dx = goal_target[0] - ball[0]
@@ -2616,12 +2686,21 @@ class StudentController:
         lateral_signed = robot_from_ball_x * (-push_unit[1]) + robot_from_ball_y * push_unit[0]
         lateral_error = abs(lateral_signed)
         late_side_finish = ball[0] > 2.15 and GOAL_HALF_WIDTH - 0.18 < abs(ball[1]) < 1.12
-        finish_zone = (
-            target_norm < 1.70
-            or ball[0] > 3.35
-            or (ball[0] > 2.85 and abs(ball[1]) < 0.72)
-            or late_side_finish
-        )
+        if ball_outside_field(ball):
+            finish_zone = (
+                (target_norm < 1.70 and abs(ball[1]) < 1.45)
+                or (ball[0] > 3.35 and abs(ball[1]) < 1.35)
+                or (ball[0] > 4.15 and abs(ball[1]) < 1.80)
+                or (ball[0] > 0.45 and abs(ball[1]) < 0.72)
+                or late_side_finish
+            )
+        else:
+            finish_zone = (
+                target_norm < 1.70
+                or ball[0] > 3.35
+                or (ball[0] > 0.45 and abs(ball[1]) < 0.72)
+                or late_side_finish
+            )
         side_channel = self._is_side_channel(ball) and not self._side_channel_resolved(ball)
         near_goal_side = ball[0] > 3.05 and abs(ball[1]) > 0.58
         side_lane = abs(ball[1]) > 1.05 and ball[0] < 3.40
@@ -2673,8 +2752,10 @@ class StudentController:
             and side_lane_ready
             and finish_lane_ready
             and ball_rel[0] < (1.30 if finish_zone else 1.20)
-            and behind_depth > (-0.22 if finish_zone else -0.18)
+            and behind_depth > (-0.14 if finish_zone else -0.06)
             and lateral_error < (0.72 if near_goal_side else 0.66)
+            and (behind_depth > -0.02 or abs(desired_heading_error) < 1.05)
+            and (not side_channel or abs(ball[1]) < 1.95 or behind_depth > 0.04)
         )
         push_ready = (
             side_lane_ready
@@ -2704,6 +2785,261 @@ class StudentController:
             and ball_rel[0] < 1.05
         )
 
+        finish_ahead_restage = (
+            finish_zone
+            and ball[0] > 4.15
+            and abs(ball[1]) <= GOAL_HALF_WIDTH + 0.18
+            and ball_rel[0] < 1.05
+            and robot_from_ball_x > 0.04
+        )
+        if finish_ahead_restage:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            restage_target = clip_to_planner_bounds(
+                (
+                    ball[0] - 0.54,
+                    clamp(ball[1], -GOAL_HALF_WIDTH + 0.16, GOAL_HALF_WIDTH - 0.16),
+                ),
+                padding=0.12,
+            )
+            restage_dist, restage_angle = relative_polar(pose, restage_target)
+            turn = clamp(2.65 * restage_angle, -RL_TURN_SCALE, RL_TURN_SCALE)
+            abs_restage_angle = abs(restage_angle)
+            if abs_restage_angle < 0.45:
+                forward = 2.4 if restage_dist > 0.18 else 0.55
+            elif abs_restage_angle < 0.90:
+                forward = 1.25
+            elif abs_restage_angle < 1.35:
+                forward = 0.75
+            else:
+                forward = 0.0
+            self.last_motion_plan = {
+                "mode": "finish_ahead_restage",
+                "target": [float(restage_target[0]), float(restage_target[1])],
+                "staging": [float(restage_target[0]), float(restage_target[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([restage_target, goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        blind_finish_memory = (
+            finish_zone
+            and not ball_visible
+            and ball[0] > 4.20
+            and ball_rel[0] < 0.95
+        )
+        if blind_finish_memory:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            turn = clamp(
+                1.45 * ball_rel[1] + 0.35 * desired_heading_error,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            if robot_from_ball_x > 0.06:
+                forward = 0.0
+            elif abs(ball_rel[1]) < 0.50:
+                forward = 2.6
+            elif abs(ball_rel[1]) < 1.05:
+                forward = 0.9
+            else:
+                forward = 0.0
+            self.last_motion_plan = {
+                "mode": "blind_finish_memory",
+                "target": [float(goal_target[0]), float(goal_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        side_wall_recover = (
+            ball_outside_field(ball)
+            and side_channel
+            and abs(ball[1]) > FIELD_Y_HALF + PLANNER_BOUNDARY_EPS
+            and abs(self.odom_pose[1]) > ARENA_Y_HALF - 0.08
+            and self.odom_pose[1] * ball[1] > 0.0
+            and (not ball_visible or ball_rel[0] > 0.78)
+            and not (contact_ready and behind_depth > 0.02 and lateral_error < 0.45)
+        )
+        if side_wall_recover:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            wall_side = 1.0 if self.odom_pose[1] >= 0.0 else -1.0
+            inward_heading = -wall_side * math.pi / 2.0
+            inward_heading_error = wrap_to_pi(inward_heading - pose[2])
+            turn = clamp(2.45 * inward_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+            abs_error = abs(inward_heading_error)
+            if abs_error < 0.42:
+                forward = 1.45
+            elif abs_error < 0.72:
+                forward = 0.65
+            else:
+                forward = 0.0
+            target = clip_to_planner_bounds(
+                (
+                    pose[0] + 0.75 * math.cos(inward_heading),
+                    pose[1] + 0.75 * math.sin(inward_heading),
+                ),
+                padding=0.24,
+            )
+            self.last_motion_plan = {
+                "mode": "boundary_wall_recover",
+                "target": [float(target[0]), float(target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([target, staging]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(inward_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        finish_side_restage = (
+            ball_outside_field(ball)
+            and finish_zone
+            and ball[0] > 4.20
+            and abs(ball[1]) > GOAL_HALF_WIDTH - 0.08
+            and ball_rel[0] < 0.90
+            and (1.0 if ball[1] >= 0.0 else -1.0) * robot_from_ball_y < 0.04
+        )
+        if finish_side_restage:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            finish_side = 1.0 if ball[1] >= 0.0 else -1.0
+            restage_target = clip_to_planner_bounds(
+                (
+                    ball[0] - 0.30,
+                    ball[1] + 0.46 * finish_side,
+                ),
+                padding=0.12,
+            )
+            restage_dist, restage_angle = relative_polar(pose, restage_target)
+            if restage_dist < 0.26:
+                turn = clamp(2.55 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+                forward = 0.0
+            else:
+                turn = clamp(2.75 * restage_angle + 0.20 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+                if abs(restage_angle) < 0.45:
+                    forward = 2.1 if restage_dist > 0.18 else 0.45
+                elif abs(restage_angle) < 0.95:
+                    forward = 0.85
+                elif abs(restage_angle) < 1.30:
+                    forward = 0.25
+                else:
+                    forward = 0.0
+            self.last_motion_plan = {
+                "mode": "finish_side_restage",
+                "target": [float(restage_target[0]), float(restage_target[1])],
+                "staging": [float(restage_target[0]), float(restage_target[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([restage_target, goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        finish_inside_restage = (
+            finish_zone
+            and near_goal_side
+            and ball_visible
+            and not finish_lane_ready
+            and ball_rel[0] < 1.05
+            and behind_depth > -0.10
+            and lateral_error < 0.76
+        )
+        if finish_inside_restage:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            restage_target = staging
+            restage_dist, restage_angle = relative_polar(pose, restage_target)
+            turn = clamp(
+                2.75 * restage_angle + 0.20 * desired_heading_error,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            abs_restage_angle = abs(restage_angle)
+            if ball_rel[0] < 0.36 and abs_restage_angle > 0.95:
+                forward = 0.0
+            elif abs_restage_angle < 0.45:
+                forward = 2.2 if restage_dist > 0.20 else 0.55
+            elif abs_restage_angle < 0.90:
+                forward = 1.05
+            elif abs_restage_angle < 1.35:
+                forward = 0.55
+            else:
+                forward = 0.0
+            if restage_dist < 0.16:
+                forward = min(forward, 0.45)
+            self.last_motion_plan = {
+                "mode": "finish_inside_restage",
+                "target": [float(restage_target[0]), float(restage_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([restage_target, goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        finish_side_drive = (
+            finish_zone
+            and near_goal_side
+            and finish_lane_ready
+            and ball_rel[0] < 0.98
+            and behind_depth > (0.16 if self.last_motion_plan.get("mode") == "finish_side_drive" else 0.24)
+            and lateral_error < (0.56 if self.last_motion_plan.get("mode") == "finish_side_drive" else 0.46)
+            and abs(desired_heading_error) < 2.20
+        )
+        if finish_side_drive:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            centerline_bias = clamp(-1.20 * ball[1], -1.15, 1.15)
+            turn = clamp(
+                0.95 * ball_rel[1] + 1.05 * desired_heading_error + 0.35 * centerline_bias,
+                -2.25,
+                2.25,
+            )
+            if abs(desired_heading_error) < 0.85 and abs(ball_rel[1]) < 0.80:
+                forward = 4.8
+            elif abs(desired_heading_error) < 1.25 and abs(ball_rel[1]) < 1.05:
+                forward = 3.3
+            elif abs(desired_heading_error) < 1.55:
+                forward = 1.6
+            else:
+                forward = 0.35
+            self.last_motion_plan = {
+                "mode": "finish_side_drive",
+                "target": [float(goal_target[0]), float(goal_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
         finish_direct = (
             (
                 ball[0] > 4.35
@@ -2711,10 +3047,10 @@ class StudentController:
                 and robot_from_ball_x < 0.18
             )
             or (
-                ball[0] > 3.45
-                and abs(ball[1]) < 0.50
-                and robot_from_ball_x < -0.05
-                and lateral_error < 0.48
+                ball[0] > 0.45
+                and abs(ball[1]) < 0.72
+                and behind_depth > -0.16
+                and lateral_error < 0.62
             )
         )
         finish_hold = (
@@ -2723,8 +3059,8 @@ class StudentController:
             and side_lane_ready
             and finish_lane_ready
             and ball_rel[0] < 1.15
-            and behind_depth > -0.12
-            and lateral_error < 0.58
+            and behind_depth > (-0.16 if ball[0] > 0.45 and abs(ball[1]) < 0.72 else -0.12)
+            and lateral_error < (0.62 if ball[0] > 0.45 and abs(ball[1]) < 0.72 else 0.58)
         )
         if finish_zone and (finish_direct or push_ready or aligned_behind or finish_hold):
             self._reset_motion_plan_commit()
@@ -2746,7 +3082,7 @@ class StudentController:
             ball[0] < -1.60
             and abs(ball[1]) > 1.05
             and ball_rel[0] < 1.15
-            and behind_depth > -0.30
+            and behind_depth > 0.02
             and lateral_error < 0.78
             and side_lane_ready
             and (staging_dist < 0.60 or lateral_error < 0.26)
@@ -2806,8 +3142,9 @@ class StudentController:
                 side_recover_target = (ball[0] - 0.58, ball[1] + 0.58 * side_sign)
             else:
                 side_recover_target = (ball[0] + 0.45, ball[1] + 0.78 * side_sign)
-            recover_target = clip_to_field(
+            recover_target = clip_to_planner_region(
                 side_recover_target,
+                ball,
                 padding=0.22,
             )
             recover_dist, recover_angle = relative_polar(pose, recover_target)
@@ -2836,11 +3173,19 @@ class StudentController:
             }
             return self._action_from_forward_turn(forward, turn)
 
+        center_recover_x_gate = 0.08
+        if not ball_visible or self.last_motion_plan.get("mode") in ("committed_arc", "committed_wide_arc"):
+            center_recover_x_gate = 0.02
+            if ball_rel[0] < 0.55:
+                center_recover_x_gate = -0.02
         center_recover = (
-            not finish_zone
+            (
+                not finish_zone
+                or (ball[0] < 2.50 and abs(ball[1]) < 0.72)
+            )
             and ball[0] < 3.55
             and abs(ball[1]) < 0.70
-            and robot_from_ball_x > 0.08
+            and robot_from_ball_x > center_recover_x_gate
             and behind_depth < 0.10
             and ball_rel[0] < 1.25
         )
@@ -2848,20 +3193,38 @@ class StudentController:
             self._reset_motion_plan_commit()
             self.rl_submode = "recenter"
             side_sign = 1.0 if robot_from_ball_y >= 0.0 else -1.0
+            recover_side_offset = 0.0
             if direct_goal_lane:
-                recover_target = clip_to_field((ball[0] - 0.58, ball[1]), padding=0.22)
+                if abs(robot_from_ball_y) > 0.12 or lateral_error > 0.18:
+                    recover_side_offset = 0.38 * side_sign
+                recover_target = clip_to_planner_region(
+                    (ball[0] - 0.58, ball[1] + recover_side_offset),
+                    ball,
+                    padding=0.22,
+                )
             else:
-                recover_target = clip_to_field(
+                recover_target = clip_to_planner_region(
                     (ball[0] - 0.58, ball[1] + 0.35 * side_sign),
+                    ball,
                     padding=0.22,
                 )
             recover_dist, recover_angle = relative_polar(pose, recover_target)
             turn = clamp(2.65 * recover_angle + 0.15 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
-            if abs(recover_angle) < 0.45:
+            abs_recover_angle = abs(recover_angle)
+            if direct_goal_lane and abs(recover_side_offset) > 0.01:
+                if abs_recover_angle < 0.55:
+                    forward = 2.4
+                elif abs_recover_angle < 1.15:
+                    forward = 1.45
+                elif abs_recover_angle < 1.65:
+                    forward = 0.75
+                else:
+                    forward = 0.20
+            elif abs_recover_angle < 0.45:
                 forward = 2.3
-            elif abs(recover_angle) < 0.95:
+            elif abs_recover_angle < 0.95:
                 forward = 1.0
-            elif abs(recover_angle) < 1.35:
+            elif abs_recover_angle < 1.35:
                 forward = 0.35
             else:
                 forward = 0.0
@@ -2904,24 +3267,60 @@ class StudentController:
             contact_heading = math.atan2(contact_target[1] - ball[1], contact_target[0] - ball[0])
             contact_heading_error = wrap_to_pi(contact_heading - pose[2])
             centerline_bias = 0.0 if direct_goal_lane else clamp(-0.95 * ball[1], -0.85, 0.85)
-            turn = clamp(
-                1.25 * ball_rel[1]
-                + 1.65 * contact_heading_error
-                + 0.22 * centerline_bias,
-                -RL_TURN_SCALE,
-                RL_TURN_SCALE,
+            near_mouth_contact = (
+                ball_outside_field(ball)
+                and finish_zone
+                and ball[0] > 4.20
+                and abs(ball[1]) > GOAL_HALF_WIDTH - 0.05
+                and ball_rel[0] < 0.75
             )
-            abs_heading = abs(contact_heading_error)
-            if abs_heading < 0.55 and abs(ball_rel[1]) < 0.75:
-                forward = 5.0
-            elif abs_heading < 1.05 and abs(ball_rel[1]) < 1.10:
-                forward = 3.6 if behind_depth > 0.18 and lateral_error < 0.42 else 2.2
-            elif abs_heading < 1.35:
-                forward = 1.2 if behind_depth > 0.18 and lateral_error < 0.50 else 0.6
+            if near_mouth_contact:
+                turn = clamp(
+                    2.35 * ball_rel[1] + 1.20 * contact_heading_error,
+                    -RL_TURN_SCALE,
+                    RL_TURN_SCALE,
+                )
+                if abs(ball_rel[1]) < 0.85 and abs(contact_heading_error) < 1.05:
+                    forward = 4.8
+                elif abs(ball_rel[1]) < 1.35 and abs(contact_heading_error) < 1.35:
+                    forward = 1.7
+                else:
+                    forward = 0.0
             else:
-                forward = 0.0
+                turn = clamp(
+                    1.25 * ball_rel[1]
+                    + 1.65 * contact_heading_error
+                    + 0.22 * centerline_bias,
+                    -RL_TURN_SCALE,
+                    RL_TURN_SCALE,
+                )
+                abs_heading = abs(contact_heading_error)
+                if abs_heading < 0.55 and abs(ball_rel[1]) < 0.75:
+                    forward = 5.0
+                elif abs_heading < 1.05 and abs(ball_rel[1]) < 1.10:
+                    forward = 3.6 if behind_depth > 0.18 and lateral_error < 0.42 else 2.2
+                elif abs_heading < 1.35:
+                    forward = 1.2 if behind_depth > 0.18 and lateral_error < 0.50 else 0.6
+                else:
+                    forward = 0.0
+            if (
+                not finish_zone
+                and abs(ball[1]) < 0.45
+                and behind_depth > -0.06
+                and lateral_error < 0.30
+                and abs(contact_heading_error) < 0.98
+            ):
+                forward = max(forward, 3.2 if behind_depth > 0.02 else 2.4)
             if behind_depth < 0.0 or robot_from_ball_x > 0.06:
-                forward = min(forward, 1.15)
+                if (
+                    not finish_zone
+                    and abs(ball[1]) < 0.40
+                    and lateral_error < 0.22
+                    and abs(contact_heading_error) < 0.90
+                ):
+                    forward = min(forward, 2.7)
+                else:
+                    forward = min(forward, 1.15)
             self.last_motion_plan = {
                 "mode": "contact_push",
                 "target": [float(contact_target[0]), float(contact_target[1])],
@@ -2953,10 +3352,17 @@ class StudentController:
                 and abs(lane_heading_error) < 0.78
             )
             or (
+                direct_goal_lane
+                and behind_depth > 0.02
+                and lateral_error < 0.54
+                and ball_rel[0] < 0.98
+                and abs(lane_heading_error) < 2.15
+            )
+            or (
                 self.last_motion_plan.get("mode") == "lane_drive_push"
-                and behind_depth > 0.12
+                and behind_depth > (0.02 if direct_goal_lane else 0.12)
                 and lateral_error < 0.48
-                and abs(lane_heading_error) < 1.05
+                and abs(lane_heading_error) < (1.80 if direct_goal_lane else 1.05)
             )
         )
         lane_drive = (
@@ -3154,7 +3560,8 @@ class StudentController:
         target_dist, target_angle = relative_polar(pose, target)
         self.rl_submode = "recenter" if side_channel else "orbit"
 
-        if distance(pose[:2], staging) < 0.22 and abs(desired_heading_error) > 0.45:
+        turn_in_place_threshold = 0.75 if ball_uses_arena_planner(ball) else 0.45
+        if distance(pose[:2], staging) < 0.22 and abs(desired_heading_error) > turn_in_place_threshold:
             turn = clamp(2.5 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
             forward = 0.0
             mode = "turn_in_place"
@@ -3609,7 +4016,11 @@ class StudentController:
 
     def _goal_finish_action(self, pose, ball, ball_rel, ball_visible=True):
         finish_lane_direct = ball[0] > 2.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18
-        if finish_lane_direct:
+        target_x = 4.95
+        if ball_outside_field(ball) and ball[0] > FIELD_X_HALF - 0.05 and GOAL_HALF_WIDTH - 0.25 < abs(ball[1]) < 1.20:
+            target_x = 4.80
+            target_y = 0.0
+        elif finish_lane_direct:
             target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.18, GOAL_HALF_WIDTH - 0.18)
         elif ball[0] > 4.05 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.14:
             target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.14, GOAL_HALF_WIDTH - 0.14)
@@ -3617,17 +4028,18 @@ class StudentController:
             target_y = 0.0
         else:
             target_y = clamp(0.22 * ball[1], -0.12, 0.12)
-        target = (4.95, target_y)
+        target = (target_x, target_y)
         target_dx = target[0] - ball[0]
         target_dy = target[1] - ball[1]
         target_norm = max(1e-6, math.hypot(target_dx, target_dy))
         goal_heading = math.atan2(target_dy, target_dx)
         goal_heading_error = wrap_to_pi(goal_heading - pose[2])
-        staging = clip_to_field(
+        staging = clip_to_planner_region(
             (
                 ball[0] - 0.32 * target_dx / target_norm,
                 ball[1] - 0.32 * target_dy / target_norm,
             ),
+            ball,
             padding=0.10,
         )
         staging_dist, staging_angle = relative_polar(pose, staging)
@@ -3661,11 +4073,12 @@ class StudentController:
                     forward = 0.8
             else:
                 inward_scale = clamp((abs(ball[1]) - 0.55) / 0.45, 0.25, 1.0)
-                center_target = clip_to_field(
+                center_target = clip_to_planner_region(
                     (
                         ball[0] - 0.22,
                         ball[1] - 0.32 * inward_scale * math.copysign(1.0, ball[1]),
                     ),
+                    ball,
                     padding=0.10,
                 )
                 center_dist, center_angle = relative_polar(pose, center_target)
@@ -3682,7 +4095,7 @@ class StudentController:
                 RL_TURN_SCALE,
             )
             if abs(goal_heading_error) < 0.85 and abs(ball_rel[1]) < 0.45:
-                forward = 5.4
+                forward = 6.0
             elif abs(goal_heading_error) < 1.35 and abs(ball_rel[1]) < 0.75:
                 forward = 2.8
             else:
@@ -3691,8 +4104,9 @@ class StudentController:
             if near_goal_side or finish_corridor:
                 inward_scale = clamp(abs(ball[1]) / max(GOAL_HALF_WIDTH, 1e-6), 0.35, 1.0)
                 inward_offset = 0.24 * inward_scale * math.copysign(1.0, ball[1])
-                reposition = clip_to_field(
+                reposition = clip_to_planner_region(
                     (ball[0] - 0.24, ball[1] + inward_offset),
+                    ball,
                     padding=0.10,
                 )
                 reposition_dist, reposition_angle = relative_polar(pose, reposition)
@@ -3721,14 +4135,19 @@ class StudentController:
                 -RL_TURN_SCALE,
                 RL_TURN_SCALE,
             )
-            forward = 5.4 if abs(goal_heading_error) < 0.95 and abs(ball_rel[1]) < 0.75 and ball_rel[0] < 0.75 else 2.6
+            if abs(goal_heading_error) < 0.95 and abs(ball_rel[1]) < 0.75 and ball_rel[0] < 0.75:
+                forward = 6.0
+            elif ball[0] > 4.22 and abs(ball[1]) < GOAL_HALF_WIDTH - 0.10:
+                forward = 4.2
+            else:
+                forward = 2.8
         elif ball[0] > 4.35 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.05:
             turn = clamp(
                 0.9 * ball_rel[1] + 1.6 * goal_heading_error + 0.7 * centerline_bias,
                 -RL_TURN_SCALE,
                 RL_TURN_SCALE,
             )
-            forward = 5.4 if abs(goal_heading_error) < 1.25 else 3.1
+            forward = 6.0 if abs(goal_heading_error) < 1.25 else 3.1
         elif staging_dist > 0.18 and ball_rel[0] > 0.28:
             turn = clamp(
                 2.6 * staging_angle + 0.5 * goal_heading_error + 0.35 * centerline_bias,
@@ -3742,7 +4161,7 @@ class StudentController:
                 -RL_TURN_SCALE,
                 RL_TURN_SCALE,
             )
-            forward = 5.0 if abs(goal_heading_error) < 1.2 else 2.8
+            forward = 6.0 if abs(goal_heading_error) < 1.2 else 2.8
 
         a_forward = 2.0 * clamp(forward / RL_FORWARD_SCALE, 0.0, 1.0) - 1.0
         a_turn = clamp(turn / RL_TURN_SCALE, -1.0, 1.0)
@@ -3792,6 +4211,14 @@ class StudentController:
 
 
     def should_enter_rl(self, sensors):
+        if self.state == "SEARCH_BALL":
+            ball_obs = sensors.get("ball")
+            if ball_obs is not None and self._needs_search_ball_alignment(tuple(ball_obs)):
+                return False
+            if ball_obs is None and self.ball_tracker.position is not None and self.ball_tracker.age <= 10:
+                ball_rel = self.ball_tracker.relative_ball(self.fused_pose)
+                if self._needs_search_ball_alignment(ball_rel):
+                    return False
         max_age = PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else 35
         return sensors.get("ball") is not None or self._has_reliable_ball_estimate(max_age=max_age)
 
