@@ -8,7 +8,6 @@ import math
 import os
 from pathlib import Path
 import shutil
-import site
 import subprocess
 import sys
 
@@ -547,18 +546,10 @@ def _deepbots_trace_path(args, suffix="deepbots", run_name=None):
 def _base_deepbots_env(args, trace_path=None):
     env = os.environ.copy()
     controller_python = getattr(args, "controller_python", None) or getattr(args, "python", None)
-    controller_python_override = bool(controller_python)
-    if controller_python:
-        controller_python = str(Path(controller_python).expanduser().resolve())
-        env["WEBOTS_CONTROLLER_PYTHON"] = controller_python
-    else:
-        controller_python = sys.executable
+    controller_python = str(Path(controller_python or sys.executable).expanduser().resolve())
+    env["WEBOTS_CONTROLLER_PYTHON"] = controller_python
     python_bin_dir = Path(controller_python).resolve().parent
     env["PATH"] = f"{python_bin_dir}{os.pathsep}{env.get('PATH', '')}"
-    site_paths = [] if controller_python_override else [path for path in site.getsitepackages() if Path(path).exists()]
-    if site_paths:
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join(site_paths + ([existing_pythonpath] if existing_pythonpath else []))
     env["PYTHONUNBUFFERED"] = "1"
     env["RL_DEEPBOTS_PHASE"] = str(args.phase)
     env["RL_DEEPBOTS_MAX_STEPS"] = str(args.max_episode_steps)
@@ -1559,6 +1550,7 @@ def build_parser():
     deepbots_record.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
     deepbots_record.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_record.add_argument("--seed", type=int, default=7)
+    deepbots_record.add_argument("--python", help="Python interpreter for the Webots controller.")
     deepbots_record.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_record.add_argument("--webots-bin", help="Path to the Webots executable.")
     deepbots_record.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="realtime", help="Webots run mode.")
@@ -1599,6 +1591,7 @@ def build_parser():
     deepbots_eval.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
     deepbots_eval.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_eval.add_argument("--seed", type=int, default=7)
+    deepbots_eval.add_argument("--python", help="Python interpreter for the Webots controller.")
     deepbots_eval.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_eval.add_argument("--webots-bin", help="Path to the Webots executable.")
     deepbots_eval.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast")
@@ -1632,6 +1625,7 @@ def build_parser():
     deepbots_train.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
     deepbots_train.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_train.add_argument("--seed", type=int, default=7)
+    deepbots_train.add_argument("--python", help="Python interpreter for the Webots controller.")
     deepbots_train.add_argument("--tensorboard-dir", type=Path)
     deepbots_train.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_train.add_argument("--webots-bin", help="Path to the Webots executable.")
