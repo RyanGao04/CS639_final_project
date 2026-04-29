@@ -146,6 +146,11 @@ class LocalizationVisualizer:
             Line2D([0], [0], marker="o", color="#ffffff", label="Estimated in FOV", markerfacecolor="#ffffff", markersize=7, linestyle="None"),
             Line2D([0], [0], marker="o", color="w", label="Projected landmark obs", markerfacecolor="#ffffff", markersize=7),
             Line2D([0], [0], marker="x", color="#ffffff", label="Matched field landmark", markersize=8, linestyle="None"),
+            Line2D([0], [0], color="#00e5ff", label="Planner robot path", linewidth=2.2),
+            Line2D([0], [0], color="#f2f2f2", label="Planned push lane", linewidth=1.8, linestyle="--"),
+            Line2D([0], [0], color="#ff4fd8", label="Inflated ball obstacle", linewidth=1.5, linestyle=":"),
+            Line2D([0], [0], marker="D", color="w", label="Planner target", markerfacecolor="#00e5ff", markersize=7),
+            Line2D([0], [0], marker="s", color="w", label="Ball staging point", markerfacecolor="#ff4fd8", markersize=7),
         ]
         self.ax.legend(handles=legend_items, loc="upper center", ncol=4, framealpha=0.9)
 
@@ -247,6 +252,104 @@ class LocalizationVisualizer:
         text = self.ax.text(point[0] + 0.08, point[1] + 0.08, label, fontsize=8, color=color, zorder=zorder + 1)
         self.dynamic_artists.append(text)
 
+    def _is_point(self, point):
+        return (
+            isinstance(point, (list, tuple))
+            and len(point) >= 2
+            and point[0] is not None
+            and point[1] is not None
+        )
+
+    def _draw_plan_line(self, points, color, linewidth=2.0, linestyle="-", alpha=1.0, zorder=6):
+        valid = [point for point in points if self._is_point(point)]
+        if len(valid) < 2:
+            return
+        artist = self.ax.plot(
+            [point[0] for point in valid],
+            [point[1] for point in valid],
+            color=color,
+            linewidth=linewidth,
+            linestyle=linestyle,
+            alpha=alpha,
+            zorder=zorder,
+        )[0]
+        self.dynamic_artists.append(artist)
+
+    def _draw_plan_marker(self, point, color, marker, label, size=85, zorder=9):
+        if not self._is_point(point):
+            return
+        artist = self.ax.scatter(
+            [point[0]],
+            [point[1]],
+            c=color,
+            s=size,
+            marker=marker,
+            edgecolors="black",
+            linewidths=0.7,
+            zorder=zorder,
+        )
+        self.dynamic_artists.append(artist)
+        text = self.ax.text(
+            point[0] + 0.07,
+            point[1] - 0.16,
+            label,
+            fontsize=8,
+            color=color,
+            weight="bold",
+            zorder=zorder + 1,
+        )
+        self.dynamic_artists.append(text)
+
+    def _draw_motion_plan(self, snapshot):
+        plan = snapshot.get("motion_plan") or {}
+        if not plan:
+            return
+
+        robot_pose = snapshot.get("estimated_pose")
+        robot_xy = robot_pose[:2] if self._is_point(robot_pose) else None
+        ball = snapshot.get("estimated_ball")
+        target = plan.get("target")
+        staging = plan.get("staging")
+        goal_target = plan.get("goal_target")
+        path = plan.get("path") or []
+        obstacle_radius = plan.get("obstacle_radius")
+
+        robot_path = [robot_xy]
+        if path:
+            robot_path.extend(point for point in path if self._is_point(point))
+        else:
+            if self._is_point(target):
+                robot_path.append(target)
+            if self._is_point(staging) and target != staging:
+                robot_path.append(staging)
+        self._draw_plan_line(robot_path, color="#00e5ff", linewidth=2.2, zorder=6)
+
+        if self._is_point(ball) and obstacle_radius is not None:
+            obstacle = Circle(
+                (ball[0], ball[1]),
+                float(obstacle_radius),
+                fill=False,
+                edgecolor="#ff4fd8",
+                linewidth=1.5,
+                linestyle=":",
+                alpha=0.95,
+                zorder=6,
+            )
+            self.ax.add_patch(obstacle)
+            self.dynamic_artists.append(obstacle)
+
+        if self._is_point(staging) and self._is_point(ball):
+            self._draw_plan_line([staging, ball], color="#ff4fd8", linewidth=1.7, linestyle="--", alpha=0.85, zorder=6)
+        if self._is_point(ball) and self._is_point(goal_target):
+            self._draw_plan_line([ball, goal_target], color="#f2f2f2", linewidth=1.8, linestyle="--", alpha=0.95, zorder=6)
+        elif plan.get("mode") in ("push", "finish") and self._is_point(ball) and self._is_point(target):
+            self._draw_plan_line([ball, target], color="#f2f2f2", linewidth=1.8, linestyle="--", alpha=0.95, zorder=6)
+
+        self._draw_plan_marker(target, color="#00e5ff", marker="D", label="plan target", size=78, zorder=10)
+        self._draw_plan_marker(staging, color="#ff4fd8", marker="s", label="staging", size=78, zorder=9)
+        if self._is_point(goal_target):
+            self._draw_plan_marker(goal_target, color="#f2f2f2", marker="*", label="goal target", size=115, zorder=9)
+
     def _render_snapshot(self, snapshot):
         self._clear_dynamic_artists()
 
@@ -271,6 +374,7 @@ class LocalizationVisualizer:
 
         self._draw_ball(snapshot.get("actual_ball"), color="#ffdd57", label="ball true", zorder=7)
         self._draw_ball(snapshot.get("estimated_ball"), color="#ff7f0e", label="ball est", zorder=8)
+        self._draw_motion_plan(snapshot)
         self._draw_pose(snapshot.get("actual_pose"), color="#2ca02c", label="robot true", alpha=0.9, zorder=8)
         self._draw_pose(snapshot.get("localizer_pose"), color="#1f77b4", label="localizer", alpha=0.65, zorder=8)
         self._draw_pose(snapshot.get("estimated_pose"), color="#d62728", label="fused", alpha=0.9, zorder=9)
@@ -281,6 +385,8 @@ class LocalizationVisualizer:
         fused = localization.get("fused") or {}
         localizer = localization.get("localizer") or {}
         landmark = localization.get("landmark_bin", "unknown")
+        plan = snapshot.get("motion_plan") or {}
+        plan_mode = plan.get("mode", "none")
         trust = localization.get("pose_correction_trust", 0.0)
         ess = localization.get("effective_sample_size_norm", 0.0)
         fused_error = fused.get("pos_error")
@@ -288,7 +394,7 @@ class LocalizationVisualizer:
         fused_text = "?" if fused_error is None else f"{fused_error:.2f}m"
         raw_text = "?" if raw_error is None else f"{raw_error:.2f}m"
         self.ax.set_title(
-            f"State: {state} | bin={landmark} | conf={confidence:.2f} "
+            f"State: {state} | plan={plan_mode} | bin={landmark} | conf={confidence:.2f} "
             f"trust={trust:.2f} ESS={ess:.2f} | fused err={fused_text} raw err={raw_text}"
         )
         self.fig.canvas.draw_idle()

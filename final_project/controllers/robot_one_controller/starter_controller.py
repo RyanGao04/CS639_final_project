@@ -28,6 +28,7 @@ RL_FORWARD_SCALE = 5.6
 RL_TURN_SCALE = 3.2
 VISUALIZER_DEFAULT_ENABLED = True
 OBSERVATION_FOV = math.pi / 2.0
+PLANNER_BALL_MEMORY_STEPS = 6000
 
 
 def clamp(value, low, high):
@@ -1164,6 +1165,9 @@ class EmbeddedActorPolicy:
 
 class StudentController:
     def __init__(self):
+        seed_raw = os.environ.get("STARTER_NUMPY_SEED", "7")
+        if seed_raw:
+            np.random.seed(int(seed_raw))
         self.localizer = MultiHypothesisLocalizer()
         self.ball_tracker = BallTracker()
         self.visualizer = LiveVisualizerClient()
@@ -1175,7 +1179,13 @@ class StudentController:
         self.step_count = 0
         self.search_direction = 1.0
         self.attack_goal = RIGHT_GOAL
-        self.opening_active = os.environ.get("OPENING_VISIBLE_OVERRIDE", "1") != "0"
+        self.motion_planner_enabled = os.environ.get("MOTION_PLANNER_CONTROL", "1") != "0"
+        opening_override = os.environ.get("OPENING_VISIBLE_OVERRIDE")
+        self.opening_active = (
+            (not self.motion_planner_enabled)
+            if opening_override is None
+            else opening_override != "0"
+        )
         self.opening_ball_position = None
         self.opening_ball_age = 10**9
         self.opening_seen_steps = 0
@@ -1215,6 +1225,14 @@ class StudentController:
         self.no_structure_steps = 0
         self.low_observability_steps = 0
         self.localization_recovery_steps = 0
+        self.last_motion_plan = {}
+        self.planner_committed_path = []
+        self.planner_committed_mode = None
+        self.planner_committed_ball = None
+        self.planner_committed_staging = None
+        self.planner_committed_goal_target = None
+        self.planner_waypoint_index = 0
+        self.planner_commit_steps = 0
 
     def close(self):
         self.visualizer.close()
@@ -1231,6 +1249,7 @@ class StudentController:
                 self.side_stall_steps = 0
                 self.rl_submode = "orbit"
                 self.rl_push_steps = 0
+                self._reset_motion_plan_commit()
 
     def _wheel_command(self, forward, turn):
         self.prev_forward_cmd = clamp(forward / RL_FORWARD_SCALE, -1.0, 1.0)
@@ -2096,7 +2115,13 @@ class StudentController:
         if ball_obs is not None:
             self.last_seen_ball_rel = tuple(ball_obs)
             return tuple(ball_obs), self.ball_tracker.position
-        if self.ball_tracker.is_fresh(max_age=120):
+        max_age = PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else 120
+        has_planner_memory = (
+            self.motion_planner_enabled
+            and self.ball_tracker.position is not None
+            and self.ball_tracker.age <= max_age
+        )
+        if has_planner_memory or self.ball_tracker.is_fresh(max_age=max_age):
             rel_ball = self.ball_tracker.relative_ball(pose)
             if rel_ball is not None:
                 return rel_ball, self.ball_tracker.position
@@ -2177,6 +2202,990 @@ class StudentController:
         }
         return features, context
 
+    def _action_from_forward_turn(self, forward, turn):
+        a_forward = 2.0 * clamp(forward / RL_FORWARD_SCALE, 0.0, 1.0) - 1.0
+        a_turn = clamp(turn / RL_TURN_SCALE, -1.0, 1.0)
+        return np.array([a_forward, a_turn], dtype=np.float32)
+
+    def _reset_motion_plan_commit(self):
+        self.planner_committed_path = []
+        self.planner_committed_mode = None
+        self.planner_committed_ball = None
+        self.planner_committed_staging = None
+        self.planner_committed_goal_target = None
+        self.planner_waypoint_index = 0
+        self.planner_commit_steps = 0
+
+    def _commit_motion_plan(self, waypoint, ball, staging, goal_target):
+        path = list(waypoint.get("path", []))
+        if not path:
+            path = [waypoint["target"]]
+        self.planner_committed_path = [tuple(point) for point in path]
+        self.planner_committed_mode = str(waypoint.get("name", "path"))
+        self.planner_committed_ball = tuple(ball)
+        self.planner_committed_staging = tuple(staging)
+        self.planner_committed_goal_target = tuple(goal_target)
+        self.planner_waypoint_index = 0
+        self.planner_commit_steps = 0
+
+    def _committed_path_remaining(self):
+        index = clamp(
+            int(self.planner_waypoint_index),
+            0,
+            max(0, len(self.planner_committed_path) - 1),
+        )
+        return self.planner_committed_path[index:]
+
+    def _advance_committed_waypoint(self, pose):
+        while self.planner_waypoint_index < len(self.planner_committed_path):
+            target = self.planner_committed_path[self.planner_waypoint_index]
+            target_dist, _ = relative_polar(pose, target)
+            is_last = self.planner_waypoint_index >= len(self.planner_committed_path) - 1
+            threshold = 0.18 if is_last else 0.26
+            if target_dist > threshold:
+                break
+            self.planner_waypoint_index += 1
+        if self.planner_waypoint_index >= len(self.planner_committed_path):
+            return None
+        return self.planner_committed_path[self.planner_waypoint_index]
+
+    def _committed_path_valid(self, pose, ball, staging, obstacle_radius):
+        if not self.planner_committed_path:
+            return False
+        if self.planner_commit_steps > 1800:
+            return False
+        if self.planner_committed_ball is None or distance(ball, self.planner_committed_ball) > 0.32:
+            return False
+        if self.planner_committed_staging is None or distance(staging, self.planner_committed_staging) > 0.42:
+            return False
+        if distance(pose[:2], staging) < 0.22:
+            return False
+
+        remaining = self._committed_path_remaining()
+        if not remaining:
+            return False
+        clearance = self._path_ball_clearance(pose[:2], remaining, ball)
+        if clearance < obstacle_radius - 0.08 and distance(pose[:2], ball) > obstacle_radius - 0.04:
+            return False
+        return True
+
+    def _planner_follow_action(
+        self,
+        pose,
+        target,
+        desired_heading_error,
+        clearance,
+        ball_visible,
+        ball_rel,
+        behind_depth,
+        cautious=False,
+    ):
+        target_dist, target_angle = relative_polar(pose, target)
+        turn = clamp(
+            2.85 * target_angle
+            + (0.30 * desired_heading_error if target_dist < 0.45 else 0.0),
+            -RL_TURN_SCALE,
+            RL_TURN_SCALE,
+        )
+        abs_angle = abs(target_angle)
+        if cautious:
+            if abs_angle < 0.50:
+                forward = 0.45 if target_dist > 0.18 else 0.20
+            elif abs_angle < 0.85 and clearance > 0.18:
+                forward = 0.22
+            else:
+                forward = 0.0
+        elif abs_angle < 0.38:
+            forward = 3.0
+        elif abs_angle < 0.85:
+            forward = 1.15
+        elif abs_angle < 1.25:
+            forward = 0.35
+        else:
+            forward = 0.0
+
+        if target_dist < 0.18:
+            forward = min(forward, 0.45)
+        if clearance < 0.40:
+            forward = min(forward, 0.55 if abs_angle < 0.70 else 0.0)
+        if ball_visible and ball_rel[0] < 0.55 and behind_depth < 0.02:
+            forward = min(forward, 0.45 if abs_angle < 0.70 else 0.0)
+        return forward, turn, target_dist, target_angle
+
+    def _planner_goal_target(self, ball):
+        if ball[0] > 0.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18:
+            target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.18, GOAL_HALF_WIDTH - 0.18)
+        elif ball[0] > 3.55:
+            target_y = clamp(0.18 * ball[1], -0.12, 0.12)
+        elif abs(ball[1]) > 1.35:
+            target_y = 0.0
+        elif abs(ball[1]) > GOAL_HALF_WIDTH - 0.10 and ball[0] < 2.80:
+            target_y = clamp(0.45 * ball[1], -0.48, 0.48)
+        elif abs(ball[1]) > GOAL_HALF_WIDTH - 0.10:
+            target_y = 0.0
+        else:
+            target_y = clamp(0.30 * ball[1], -0.24, 0.24)
+        return (4.95, target_y)
+
+    def _segment_point_clearance(self, start, end, point):
+        sx, sy = start
+        ex, ey = end
+        px, py = point
+        dx = ex - sx
+        dy = ey - sy
+        length_sq = dx * dx + dy * dy
+        if length_sq < 1e-9:
+            return math.hypot(px - sx, py - sy)
+        t = clamp(((px - sx) * dx + (py - sy) * dy) / length_sq, 0.0, 1.0)
+        closest_x = sx + t * dx
+        closest_y = sy + t * dy
+        return math.hypot(px - closest_x, py - closest_y)
+
+    def _path_length(self, points):
+        total = 0.0
+        for start, end in zip(points, points[1:]):
+            total += distance(start, end)
+        return total
+
+    def _path_ball_clearance(self, start, path, ball):
+        points = [start] + list(path)
+        if len(points) < 2:
+            return distance(start, ball)
+        clearance = min(distance(point, ball) for point in points)
+        for a, b in zip(points, points[1:]):
+            clearance = min(clearance, self._segment_point_clearance(a, b, ball))
+        return clearance
+
+    def _path_wall_margin(self, path):
+        if not path:
+            return 0.0
+        return min(
+            min(FIELD_X_HALF - abs(point[0]), FIELD_Y_HALF - abs(point[1]))
+            for point in path
+        )
+
+    def _planner_staging_point(self, ball, push_unit, staging_offset):
+        desired_angle = math.atan2(-push_unit[1], -push_unit[0])
+        padding = 0.18
+        min_x = -FIELD_X_HALF + padding
+        max_x = FIELD_X_HALF - padding
+        min_y = -FIELD_Y_HALF + padding
+        max_y = FIELD_Y_HALF - padding
+        radii = (
+            max(0.68, staging_offset),
+            max(0.78, staging_offset + 0.10),
+            max(0.90, staging_offset + 0.22),
+        )
+        deltas = (
+            0.0,
+            0.28,
+            -0.28,
+            0.55,
+            -0.55,
+            0.85,
+            -0.85,
+            1.15,
+            -1.15,
+            1.45,
+            -1.45,
+            1.85,
+            -1.85,
+            2.25,
+            -2.25,
+            2.70,
+            -2.70,
+        )
+
+        best = None
+        for radius in radii:
+            for delta in deltas:
+                angle = desired_angle + delta
+                candidate = (
+                    ball[0] + radius * math.cos(angle),
+                    ball[1] + radius * math.sin(angle),
+                )
+                if not (min_x <= candidate[0] <= max_x and min_y <= candidate[1] <= max_y):
+                    continue
+                from_ball_x = candidate[0] - ball[0]
+                from_ball_y = candidate[1] - ball[1]
+                behind_score = (
+                    from_ball_x * (-push_unit[0])
+                    + from_ball_y * (-push_unit[1])
+                )
+                lateral_error = abs(
+                    from_ball_x * (-push_unit[1])
+                    + from_ball_y * push_unit[0]
+                )
+                wall_margin = min(
+                    FIELD_X_HALF - abs(candidate[0]),
+                    FIELD_Y_HALF - abs(candidate[1]),
+                )
+                score = (
+                    0.72 * abs(delta)
+                    + 0.72 * lateral_error
+                    - 0.60 * behind_score
+                    + 0.12 * abs(radius - staging_offset)
+                )
+                if behind_score < 0.05:
+                    score += 2.0 + 2.0 * abs(behind_score)
+                if wall_margin < 0.22:
+                    score += 0.70 * (0.22 - wall_margin)
+                if best is None or score < best[0]:
+                    best = (score, candidate)
+
+        if best is not None:
+            return best[1]
+
+        fallback = (
+            ball[0] - staging_offset * push_unit[0],
+            ball[1] - staging_offset * push_unit[1],
+        )
+        fallback = clip_to_field(fallback, padding=padding)
+        from_ball_x = fallback[0] - ball[0]
+        from_ball_y = fallback[1] - ball[1]
+        fallback_dist = math.hypot(from_ball_x, from_ball_y)
+        if fallback_dist < 0.62:
+            angle = math.atan2(from_ball_y, from_ball_x)
+            fallback = (
+                ball[0] + 0.62 * math.cos(angle),
+                ball[1] + 0.62 * math.sin(angle),
+            )
+            fallback = clip_to_field(fallback, padding=padding)
+        return fallback
+
+    def _planner_arc_path(self, pose, ball, staging, push_unit, sign, radius):
+        start_angle = math.atan2(pose[1] - ball[1], pose[0] - ball[0])
+        end_angle = math.atan2(staging[1] - ball[1], staging[0] - ball[0])
+        span = wrap_to_pi(end_angle - start_angle)
+        if sign > 0.0 and span < 0.0:
+            span += 2.0 * math.pi
+        elif sign < 0.0 and span > 0.0:
+            span -= 2.0 * math.pi
+
+        abs_span = abs(span)
+        steps = max(2, min(7, int(math.ceil(abs_span / 0.42))))
+        points = []
+        for idx in range(1, steps + 1):
+            angle = start_angle + span * idx / float(steps + 1)
+            point = (
+                ball[0] + radius * math.cos(angle),
+                ball[1] + radius * math.sin(angle),
+            )
+            point = clip_to_field(point, padding=0.18)
+            if distance(point, ball) >= 0.52:
+                points.append(point)
+
+        if not points or distance(points[-1], staging) > 0.12:
+            points.append(staging)
+        else:
+            points[-1] = staging
+        return points
+
+    def _planner_path_score(self, pose, ball, staging, path, ball_safety, target_name):
+        if not path:
+            path = [staging]
+        target = path[0]
+        target_dist, target_angle = relative_polar(pose, target)
+        clearance = self._path_ball_clearance(pose[:2], path, ball)
+        wall_margin = self._path_wall_margin(path)
+        path_points = [pose[:2]] + list(path)
+        path_length = self._path_length(path_points)
+        staging_error = distance(path[-1], staging)
+
+        smoothness = 0.0
+        if len(path_points) >= 3:
+            for a, b, c in zip(path_points, path_points[1:], path_points[2:]):
+                heading_1 = math.atan2(b[1] - a[1], b[0] - a[0])
+                heading_2 = math.atan2(c[1] - b[1], c[0] - b[0])
+                smoothness += abs(wrap_to_pi(heading_2 - heading_1))
+
+        score = (
+            path_length
+            + 0.42 * abs(target_angle)
+            + 0.20 * smoothness
+            + 1.15 * staging_error
+        )
+        if clearance < ball_safety:
+            score += 8.0 + 45.0 * (ball_safety - clearance) ** 2
+        if wall_margin < 0.10:
+            score += 4.0 + 18.0 * (0.10 - wall_margin) ** 2
+        return {
+            "name": target_name,
+            "target": target,
+            "path": path,
+            "score": score,
+            "distance": target_dist,
+            "angle": target_angle,
+            "clearance": clearance,
+            "wall_margin": wall_margin,
+            "path_length": path_length,
+            "smoothness": smoothness,
+        }
+
+    def _planner_choose_waypoint(self, pose, ball, staging, push_unit, include_staging=True):
+        robot_from_ball_x = pose[0] - ball[0]
+        robot_from_ball_y = pose[1] - ball[1]
+        robot_ball_radius = max(0.05, math.hypot(robot_from_ball_x, robot_from_ball_y))
+        current_angle = math.atan2(robot_from_ball_y, robot_from_ball_x)
+        desired_behind_angle = math.atan2(-push_unit[1], -push_unit[0])
+        orbit_error = wrap_to_pi(desired_behind_angle - current_angle)
+        preferred_sign = 1.0 if orbit_error >= 0.0 else -1.0
+
+        orbit_radius = 0.82
+        if abs(ball[1]) > FIELD_Y_HALF - 0.65:
+            orbit_radius = 0.66
+        if abs(ball[0]) > FIELD_X_HALF - 0.85:
+            orbit_radius = min(orbit_radius, 0.58)
+        ball_safety = 0.44 if robot_ball_radius < 0.60 else 0.50
+        orbit_radius = max(
+            orbit_radius,
+            ball_safety + 0.16,
+            min(1.10, robot_ball_radius),
+            min(1.05, distance(staging, ball) + 0.04),
+        )
+
+        candidates = []
+        if include_staging:
+            direct_clearance = self._path_ball_clearance(pose[:2], [staging], ball)
+            direct_margin = 0.18 if robot_ball_radius < 1.15 else 0.10
+            if direct_clearance >= ball_safety + direct_margin:
+                candidates.append(("direct", [staging]))
+        for sign in (preferred_sign, -preferred_sign):
+            candidates.append(
+                (
+                    "arc",
+                    self._planner_arc_path(pose, ball, staging, push_unit, sign, orbit_radius),
+                )
+            )
+            candidates.append(
+                (
+                    "wide_arc",
+                    self._planner_arc_path(
+                        pose,
+                        ball,
+                        staging,
+                        push_unit,
+                        sign,
+                        min(1.16, orbit_radius + 0.22),
+                    ),
+                )
+            )
+
+        scored = [
+            self._planner_path_score(pose, ball, staging, path, ball_safety, name)
+            for name, path in candidates
+        ]
+        best = min(scored, key=lambda item: item["score"])
+        best["staging"] = staging
+        best["orbit_error"] = orbit_error
+        return best
+
+    def _planner_path_payload(self, path):
+        return [[float(point[0]), float(point[1])] for point in path]
+
+    def _motion_planning_prior(self, context):
+        if not self.motion_planner_enabled:
+            return None
+
+        pose = context.get("pose", self.fused_pose)
+        ball = context.get("ball_position")
+        ball_rel = context.get("ball_rel")
+        if ball is None or ball_rel is None:
+            self.last_motion_plan = {}
+            return None
+
+        ball_visible = bool(context.get("ball_visible", False))
+        if not ball_visible and self.ball_tracker.age > (PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else 120):
+            self.last_motion_plan = {}
+            return None
+
+        ball = clip_to_field(ball, padding=0.08)
+        direct_goal_lane = ball[0] > 0.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18
+        goal_target = self._planner_goal_target(ball)
+        target_dx = goal_target[0] - ball[0]
+        target_dy = goal_target[1] - ball[1]
+        target_norm = max(1e-6, math.hypot(target_dx, target_dy))
+        push_unit = (target_dx / target_norm, target_dy / target_norm)
+        desired_heading = math.atan2(push_unit[1], push_unit[0])
+        desired_heading_error = wrap_to_pi(desired_heading - pose[2])
+
+        robot_from_ball_x = pose[0] - ball[0]
+        robot_from_ball_y = pose[1] - ball[1]
+        robot_ball_radius = math.hypot(robot_from_ball_x, robot_from_ball_y)
+        behind_depth = robot_from_ball_x * (-push_unit[0]) + robot_from_ball_y * (-push_unit[1])
+        lateral_signed = robot_from_ball_x * (-push_unit[1]) + robot_from_ball_y * push_unit[0]
+        lateral_error = abs(lateral_signed)
+        late_side_finish = ball[0] > 2.15 and GOAL_HALF_WIDTH - 0.18 < abs(ball[1]) < 1.12
+        finish_zone = (
+            target_norm < 1.70
+            or ball[0] > 3.35
+            or (ball[0] > 2.85 and abs(ball[1]) < 0.72)
+            or late_side_finish
+        )
+        side_channel = self._is_side_channel(ball) and not self._side_channel_resolved(ball)
+        near_goal_side = ball[0] > 3.05 and abs(ball[1]) > 0.58
+        side_lane = abs(ball[1]) > 1.05 and ball[0] < 3.40
+        side_lane_ready = True
+        if side_lane:
+            side_sign = 1.0 if ball[1] > 0.0 else -1.0
+            side_tolerance = -0.16 if ball[0] < -1.40 else -0.04
+            outside_side_ready = side_sign * robot_from_ball_y >= -0.05
+            side_lane_ready = outside_side_ready or side_sign * lateral_signed >= side_tolerance
+        finish_lane_ready = True
+        if finish_zone and abs(ball[1]) > 0.55:
+            finish_sign = 1.0 if ball[1] > 0.0 else -1.0
+            finish_lane_ready = (
+                finish_sign * lateral_signed >= -0.03
+                or finish_sign * robot_from_ball_y >= -0.08
+            )
+        obstacle_radius = 0.44 if robot_ball_radius < 0.60 else 0.50
+
+        staging_offset = 0.74
+        if finish_zone:
+            staging_offset = 0.52
+        elif ball_rel[0] < 0.70:
+            staging_offset = 0.62
+        if side_channel:
+            staging_offset = max(staging_offset, 0.68)
+
+        staging = self._planner_staging_point(ball, push_unit, staging_offset)
+        staging_dist, staging_angle = relative_polar(pose, staging)
+        staging_gate = staging_dist < (0.34 if finish_zone else 0.40)
+        line_lateral_limit = 0.36 if finish_zone else (0.28 if near_goal_side else 0.24)
+        line_contact_ready = (
+            behind_depth > (0.28 if finish_zone else 0.34)
+            and lateral_error < line_lateral_limit
+            and ball_rel[0] < (0.92 if finish_zone else 0.86)
+        )
+        contact_ready = staging_gate or line_contact_ready
+        push_hold = (
+            self.rl_submode == "push"
+            and side_lane_ready
+            and finish_lane_ready
+            and contact_ready
+            and ball_rel[0] < (1.05 if finish_zone else 0.92)
+            and behind_depth > (-0.12 if finish_zone else -0.04)
+            and lateral_error < (0.50 if near_goal_side else 0.42)
+            and abs(desired_heading_error) < (1.50 if near_goal_side else 1.35)
+        )
+        contact_hold = (
+            self.last_motion_plan.get("mode") == "contact_push"
+            and side_lane_ready
+            and finish_lane_ready
+            and ball_rel[0] < (1.30 if finish_zone else 1.20)
+            and behind_depth > (-0.22 if finish_zone else -0.18)
+            and lateral_error < (0.72 if near_goal_side else 0.66)
+        )
+        push_ready = (
+            side_lane_ready
+            and finish_lane_ready
+            and contact_ready
+            and (
+                (
+                    ball_rel[0] < (0.82 if finish_zone else 0.74)
+                    and behind_depth > (-0.02 if finish_zone else 0.08)
+                    and lateral_error < (0.46 if near_goal_side else 0.38)
+                    and abs(desired_heading_error) < (1.25 if near_goal_side else 1.05)
+                )
+                or (
+                    ball_rel[0] < 0.52
+                    and behind_depth > -0.08
+                    and lateral_error < 0.34
+                    and abs(desired_heading_error) < 1.05
+                )
+            )
+        ) or push_hold
+        aligned_behind = (
+            side_lane_ready
+            and finish_lane_ready
+            and contact_ready
+            and behind_depth > (0.14 if finish_zone else 0.22)
+            and lateral_error < (0.52 if near_goal_side else 0.46)
+            and ball_rel[0] < 1.05
+        )
+
+        finish_direct = (
+            (
+                ball[0] > 4.35
+                and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.08
+                and robot_from_ball_x < 0.18
+            )
+            or (
+                ball[0] > 3.45
+                and abs(ball[1]) < 0.50
+                and robot_from_ball_x < -0.05
+                and lateral_error < 0.48
+            )
+        )
+        finish_hold = (
+            self.last_motion_plan.get("mode") == "finish"
+            and finish_zone
+            and side_lane_ready
+            and finish_lane_ready
+            and ball_rel[0] < 1.15
+            and behind_depth > -0.12
+            and lateral_error < 0.58
+        )
+        if finish_zone and (finish_direct or push_ready or aligned_behind or finish_hold):
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            self.last_motion_plan = {
+                "mode": "finish",
+                "target": [float(goal_target[0]), float(goal_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+            }
+            return self._goal_finish_action(pose, ball, ball_rel, ball_visible=ball_visible)
+
+        corner_escape = (
+            ball[0] < -1.60
+            and abs(ball[1]) > 1.05
+            and ball_rel[0] < 1.15
+            and behind_depth > -0.30
+            and lateral_error < 0.78
+            and side_lane_ready
+            and (staging_dist < 0.60 or lateral_error < 0.26)
+        )
+        if corner_escape:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            escape_target_y = -0.55 if ball[1] > 0.0 else 0.55
+            escape_heading = math.atan2(escape_target_y - ball[1], 4.80 - ball[0])
+            escape_heading_error = wrap_to_pi(escape_heading - pose[2])
+            turn = clamp(
+                1.65 * ball_rel[1] + 1.25 * escape_heading_error,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            if abs(escape_heading_error) > 1.15:
+                forward = 0.0
+            elif abs(ball_rel[1]) < 0.72:
+                forward = 5.2
+            elif abs(ball_rel[1]) < 1.15:
+                forward = 2.4
+            else:
+                forward = 0.4
+            self.last_motion_plan = {
+                "mode": "corner_escape_push",
+                "target": [float(goal_target[0]), float(goal_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(escape_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        lane_side_ready = True
+        if abs(ball[1]) > 0.25 and not direct_goal_lane:
+            lane_sign = 1.0 if ball[1] > 0.0 else -1.0
+            lane_side_ready = (
+                lane_sign * robot_from_ball_y >= -0.06
+                or lane_sign * lateral_signed >= -0.02
+            )
+        side_recover = (
+            not finish_zone
+            and -0.35 < ball[0] < 3.40
+            and 0.75 < abs(ball[1]) < 2.15
+            and not lane_side_ready
+            and ball_rel[0] < 1.45
+        )
+        if side_recover:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            side_sign = 1.0 if ball[1] > 0.0 else -1.0
+            if ball[1] < 0.0:
+                side_recover_target = (ball[0] - 0.58, ball[1] + 0.58 * side_sign)
+            else:
+                side_recover_target = (ball[0] + 0.45, ball[1] + 0.78 * side_sign)
+            recover_target = clip_to_field(
+                side_recover_target,
+                padding=0.22,
+            )
+            recover_dist, recover_angle = relative_polar(pose, recover_target)
+            turn = clamp(2.55 * recover_angle + 0.20 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+            if abs(recover_angle) < 0.45:
+                forward = 2.2
+            elif abs(recover_angle) < 0.95:
+                forward = 1.0
+            elif abs(recover_angle) < 1.35:
+                forward = 0.35
+            else:
+                forward = 0.0
+            if recover_dist < 0.16:
+                forward = min(forward, 0.45)
+            self.last_motion_plan = {
+                "mode": "side_recover",
+                "target": [float(recover_target[0]), float(recover_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([recover_target, staging]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        center_recover = (
+            not finish_zone
+            and ball[0] < 3.55
+            and abs(ball[1]) < 0.70
+            and robot_from_ball_x > 0.08
+            and behind_depth < 0.10
+            and ball_rel[0] < 1.25
+        )
+        if center_recover:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "recenter"
+            side_sign = 1.0 if robot_from_ball_y >= 0.0 else -1.0
+            if direct_goal_lane:
+                recover_target = clip_to_field((ball[0] - 0.58, ball[1]), padding=0.22)
+            else:
+                recover_target = clip_to_field(
+                    (ball[0] - 0.58, ball[1] + 0.35 * side_sign),
+                    padding=0.22,
+                )
+            recover_dist, recover_angle = relative_polar(pose, recover_target)
+            turn = clamp(2.65 * recover_angle + 0.15 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+            if abs(recover_angle) < 0.45:
+                forward = 2.3
+            elif abs(recover_angle) < 0.95:
+                forward = 1.0
+            elif abs(recover_angle) < 1.35:
+                forward = 0.35
+            else:
+                forward = 0.0
+            if recover_dist < 0.16:
+                forward = min(forward, 0.45)
+            self.last_motion_plan = {
+                "mode": "center_recover",
+                "target": [float(recover_target[0]), float(recover_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([recover_target, staging]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(desired_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        contact_control = (
+            side_lane_ready
+            and finish_lane_ready
+            and (
+                (
+                    contact_ready
+                    and ball_rel[0] < (1.15 if finish_zone else 1.05)
+                    and behind_depth > (-0.12 if finish_zone else -0.08)
+                    and lateral_error < (0.56 if near_goal_side else 0.50)
+                )
+                or contact_hold
+            )
+        )
+        if contact_control:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            if not finish_zone and ball[0] < 3.75 and abs(ball[1]) < 1.55:
+                contact_target = (4.85, goal_target[1])
+            else:
+                contact_target = goal_target
+            contact_heading = math.atan2(contact_target[1] - ball[1], contact_target[0] - ball[0])
+            contact_heading_error = wrap_to_pi(contact_heading - pose[2])
+            centerline_bias = 0.0 if direct_goal_lane else clamp(-0.95 * ball[1], -0.85, 0.85)
+            turn = clamp(
+                1.25 * ball_rel[1]
+                + 1.65 * contact_heading_error
+                + 0.22 * centerline_bias,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            abs_heading = abs(contact_heading_error)
+            if abs_heading < 0.55 and abs(ball_rel[1]) < 0.75:
+                forward = 5.0
+            elif abs_heading < 1.05 and abs(ball_rel[1]) < 1.10:
+                forward = 3.6 if behind_depth > 0.18 and lateral_error < 0.42 else 2.2
+            elif abs_heading < 1.35:
+                forward = 1.2 if behind_depth > 0.18 and lateral_error < 0.50 else 0.6
+            else:
+                forward = 0.0
+            if behind_depth < 0.0 or robot_from_ball_x > 0.06:
+                forward = min(forward, 1.15)
+            self.last_motion_plan = {
+                "mode": "contact_push",
+                "target": [float(contact_target[0]), float(contact_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([contact_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(contact_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        lane_target_y = goal_target[1]
+        lane_heading = math.atan2(lane_target_y - ball[1], 4.85 - ball[0])
+        lane_heading_error = wrap_to_pi(lane_heading - pose[2])
+        lane_contact_ready = (
+            (
+                contact_ready
+                and behind_depth > 0.10
+                and lateral_error < 0.44
+                and abs(lane_heading_error) < 1.35
+            )
+            or (
+                behind_depth > 0.06
+                and lateral_error < 0.24
+                and ball_rel[0] < 0.82
+                and abs(lane_heading_error) < 0.78
+            )
+            or (
+                self.last_motion_plan.get("mode") == "lane_drive_push"
+                and behind_depth > 0.12
+                and lateral_error < 0.48
+                and abs(lane_heading_error) < 1.05
+            )
+        )
+        lane_drive = (
+            ball[0] < 3.75
+            and not finish_zone
+            and abs(ball[1]) < 1.55
+            and lane_side_ready
+            and lane_contact_ready
+            and ball_rel[0] < 0.92
+            and robot_from_ball_x < 0.16
+            and behind_depth > -0.06
+            and lateral_error < 0.65
+        )
+        if lane_drive:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            centerline_bias = 0.0 if direct_goal_lane else clamp(-0.90 * ball[1], -0.80, 0.80)
+            turn = clamp(
+                1.30 * ball_rel[1]
+                + 1.35 * lane_heading_error
+                + 0.22 * centerline_bias,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            if abs(lane_heading_error) > 1.20:
+                turn = clamp(2.25 * lane_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+                forward = 0.0
+            elif abs(ball_rel[1]) < 0.62:
+                forward = 4.4
+            elif abs(ball_rel[1]) < 1.05:
+                forward = 2.0
+            else:
+                forward = 0.5
+            if robot_from_ball_x > 0.05 or behind_depth < 0.0:
+                forward = min(forward, 1.25)
+            self.last_motion_plan = {
+                "mode": "lane_drive_push",
+                "target": [float(4.85), float(lane_target_y)],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([(4.85, lane_target_y)]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+                "desired_heading_error": float(lane_heading_error),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        if not push_ready and not aligned_behind:
+            if self._committed_path_valid(pose, ball, staging, obstacle_radius):
+                self.planner_commit_steps += 1
+                target = self._advance_committed_waypoint(pose)
+                if target is not None:
+                    remaining_path = self._committed_path_remaining()
+                    clearance = self._path_ball_clearance(pose[:2], remaining_path, ball)
+                    forward, turn, _, _ = self._planner_follow_action(
+                        pose,
+                        target,
+                        desired_heading_error,
+                        clearance,
+                        ball_visible,
+                        ball_rel,
+                        behind_depth,
+                        cautious=ball_visible and ball_rel[0] < 0.40,
+                    )
+                    self.rl_submode = "recenter" if side_channel else "orbit"
+                    self.last_motion_plan = {
+                        "mode": f"committed_{self.planner_committed_mode}",
+                        "target": [float(target[0]), float(target[1])],
+                        "staging": [float(staging[0]), float(staging[1])],
+                        "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                        "path": self._planner_path_payload(remaining_path),
+                        "obstacle_radius": float(obstacle_radius),
+                        "score": None,
+                        "clearance": float(clearance),
+                        "behind_depth": float(behind_depth),
+                        "lateral_error": float(lateral_error),
+                        "lateral_signed": float(lateral_signed),
+                        "desired_heading_error": float(desired_heading_error),
+                    }
+                    return self._action_from_forward_turn(forward, turn)
+            elif self.planner_committed_path:
+                self._reset_motion_plan_commit()
+
+        close_bump_risk = ball_visible and ball_rel[0] < 0.32 and not aligned_behind
+        if (
+            close_bump_risk
+            and (finish_zone or direct_goal_lane)
+            and behind_depth > -0.02
+            and lateral_error < 0.45
+        ):
+            close_bump_risk = False
+
+        if close_bump_risk:
+            self.rl_submode = "recenter" if side_channel else "orbit"
+            waypoint = self._planner_choose_waypoint(
+                pose,
+                ball,
+                staging,
+                push_unit,
+                include_staging=False,
+            )
+            self._commit_motion_plan(waypoint, ball, staging, goal_target)
+            target = waypoint["target"]
+            path = waypoint.get("path", [target])
+            target_dist, target_angle = relative_polar(pose, target)
+            turn = clamp(2.9 * target_angle, -RL_TURN_SCALE, RL_TURN_SCALE)
+            if abs(target_angle) < 0.50:
+                forward = 0.35 if target_dist > 0.18 else 0.18
+            elif abs(target_angle) < 0.85 and waypoint["clearance"] > 0.18:
+                forward = 0.20
+            else:
+                forward = 0.0
+            self.last_motion_plan = {
+                "mode": "avoid_close_bump",
+                "target": [float(target[0]), float(target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload(path),
+                "obstacle_radius": float(obstacle_radius),
+                "score": float(waypoint.get("score", 0.0)),
+                "clearance": float(waypoint.get("clearance", 0.0)),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        if push_ready:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "push"
+            ball_angle = ball_rel[1]
+            centerline_bias = clamp(-1.20 * ball[1], -1.15, 1.15)
+            center_gain = 0.10 if ball_rel[0] < 0.65 else (0.55 if side_channel else 0.30)
+            turn = clamp(
+                1.35 * ball_angle
+                + 1.55 * desired_heading_error
+                + center_gain * centerline_bias,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            if abs(desired_heading_error) < 0.55 and abs(ball_angle) < 0.70:
+                forward = 5.0 if not side_channel else 3.8
+            elif ball_rel[0] < 0.55 and lateral_error < 0.34 and abs(ball_angle) < 1.05:
+                forward = 4.6 if abs(desired_heading_error) < 1.15 else 2.8
+            elif abs(desired_heading_error) < 1.15 and abs(ball_angle) < 1.05:
+                forward = 2.2
+            else:
+                forward = 0.8
+            self.last_motion_plan = {
+                "mode": "push",
+                "target": [float(goal_target[0]), float(goal_target[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([goal_target]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        if aligned_behind:
+            self._reset_motion_plan_commit()
+            self.rl_submode = "align"
+            turn = clamp(
+                1.25 * ball_rel[1] + 2.05 * desired_heading_error,
+                -RL_TURN_SCALE,
+                RL_TURN_SCALE,
+            )
+            if abs(desired_heading_error) < 0.52 and abs(ball_rel[1]) < 0.80:
+                forward = 2.6 if ball_rel[0] > 0.45 else 1.0
+            elif abs(desired_heading_error) < 1.20 and abs(ball_rel[1]) < 1.15:
+                forward = 0.75
+            else:
+                forward = 0.0
+            self.last_motion_plan = {
+                "mode": "align",
+                "target": [float(staging[0]), float(staging[1])],
+                "staging": [float(staging[0]), float(staging[1])],
+                "goal_target": [float(goal_target[0]), float(goal_target[1])],
+                "path": self._planner_path_payload([staging]),
+                "obstacle_radius": float(obstacle_radius),
+                "behind_depth": float(behind_depth),
+                "lateral_error": float(lateral_error),
+                "lateral_signed": float(lateral_signed),
+            }
+            return self._action_from_forward_turn(forward, turn)
+
+        waypoint = self._planner_choose_waypoint(pose, ball, staging, push_unit)
+        self._commit_motion_plan(waypoint, ball, staging, goal_target)
+        target = waypoint["target"]
+        path = waypoint.get("path", [target])
+        target_dist, target_angle = relative_polar(pose, target)
+        self.rl_submode = "recenter" if side_channel else "orbit"
+
+        if distance(pose[:2], staging) < 0.22 and abs(desired_heading_error) > 0.45:
+            turn = clamp(2.5 * desired_heading_error, -RL_TURN_SCALE, RL_TURN_SCALE)
+            forward = 0.0
+            mode = "turn_in_place"
+        else:
+            forward, turn, _, _ = self._planner_follow_action(
+                pose,
+                target,
+                desired_heading_error,
+                waypoint["clearance"],
+                ball_visible,
+                ball_rel,
+                behind_depth,
+            )
+            mode = waypoint["name"]
+
+        self.last_motion_plan = {
+            "mode": mode,
+            "target": [float(target[0]), float(target[1])],
+            "staging": [float(staging[0]), float(staging[1])],
+            "goal_target": [float(goal_target[0]), float(goal_target[1])],
+            "path": self._planner_path_payload(path),
+            "obstacle_radius": float(obstacle_radius),
+            "score": float(waypoint.get("score", 0.0)),
+            "clearance": float(waypoint.get("clearance", 0.0)),
+            "behind_depth": float(behind_depth),
+            "lateral_error": float(lateral_error),
+            "lateral_signed": float(lateral_signed),
+            "desired_heading_error": float(desired_heading_error),
+        }
+        return self._action_from_forward_turn(forward, turn)
+
     def _geometric_rl_prior(self, context):
         pose = context.get("pose", self.localizer.pose)
         ball_visible = bool(context.get("ball_visible", False))
@@ -2184,6 +3193,10 @@ class StudentController:
         ball_rel = context.get("ball_rel")
         if ball is None or ball_rel is None:
             return np.array([-1.0, 0.0], dtype=np.float32)
+
+        planned_action = self._motion_planning_prior(context)
+        if planned_action is not None:
+            return planned_action
 
         if not ball_visible and ball_rel[0] < 0.85:
             if ball[0] > 4.25:
@@ -2595,7 +3608,15 @@ class StudentController:
         return np.array([a_forward, a_turn], dtype=np.float32)
 
     def _goal_finish_action(self, pose, ball, ball_rel, ball_visible=True):
-        target_y = clamp(0.22 * ball[1], -0.12, 0.12)
+        finish_lane_direct = ball[0] > 2.85 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.18
+        if finish_lane_direct:
+            target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.18, GOAL_HALF_WIDTH - 0.18)
+        elif ball[0] > 4.05 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.14:
+            target_y = clamp(ball[1], -GOAL_HALF_WIDTH + 0.14, GOAL_HALF_WIDTH - 0.14)
+        elif abs(ball[1]) > 0.25:
+            target_y = 0.0
+        else:
+            target_y = clamp(0.22 * ball[1], -0.12, 0.12)
         target = (4.95, target_y)
         target_dx = target[0] - ball[0]
         target_dy = target[1] - ball[1]
@@ -2610,22 +3631,34 @@ class StudentController:
             padding=0.10,
         )
         staging_dist, staging_angle = relative_polar(pose, staging)
-        centerline_bias = clamp(-1.35 * ball[1], -1.1, 1.1)
         near_goal_side = ball[0] > 3.10 and abs(ball[1]) > 0.55
         finish_corridor = ball[0] > 4.15 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.08
+        centerline_bias = 0.0 if finish_lane_direct else clamp(-1.35 * ball[1], -1.1, 1.1)
+        corridor_bias = 0.0 if finish_corridor and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.16 else centerline_bias
         ahead_margin = 0.18 if finish_corridor else 0.12
         robot_ahead_of_ball = pose[0] > ball[0] + ahead_margin
-        if finish_corridor and ball_visible and ball_rel[0] > 0.16 and abs(ball_rel[1]) < 0.45:
+        if (
+            finish_corridor
+            and ball_visible
+            and pose[0] <= ball[0] + 0.05
+            and ball_rel[0] > 0.16
+            and abs(ball_rel[1]) < 0.45
+        ):
             robot_ahead_of_ball = False
 
         if near_goal_side and abs(ball[1]) > GOAL_HALF_WIDTH - 0.02:
             if ball_visible and ball_rel[0] < 0.95:
                 turn = clamp(
-                    1.2 * ball_rel[1] + 2.0 * centerline_bias,
+                    1.10 * ball_rel[1] + 1.65 * goal_heading_error + 0.55 * centerline_bias,
                     -RL_TURN_SCALE,
                     RL_TURN_SCALE,
                 )
-                forward = 3.6 if abs(ball_rel[1]) < 0.75 else 1.4
+                if abs(goal_heading_error) < 1.10 and abs(ball_rel[1]) < 0.85:
+                    forward = 4.6
+                elif abs(goal_heading_error) < 1.45:
+                    forward = 2.0
+                else:
+                    forward = 0.8
             else:
                 inward_scale = clamp((abs(ball[1]) - 0.55) / 0.45, 0.25, 1.0)
                 center_target = clip_to_field(
@@ -2644,15 +3677,20 @@ class StudentController:
                 forward = 0.9 if center_dist > 0.15 else 0.4
         elif finish_corridor and ball_visible and ball_rel[0] > 0.16 and abs(ball_rel[1]) < 0.60:
             turn = clamp(
-                1.6 * ball_rel[1] + 1.4 * centerline_bias,
+                1.25 * ball_rel[1] + 1.85 * goal_heading_error + 0.45 * corridor_bias,
                 -RL_TURN_SCALE,
                 RL_TURN_SCALE,
             )
-            forward = 5.4 if abs(ball_rel[1]) < 0.35 else 4.2
+            if abs(goal_heading_error) < 0.85 and abs(ball_rel[1]) < 0.45:
+                forward = 5.4
+            elif abs(goal_heading_error) < 1.35 and abs(ball_rel[1]) < 0.75:
+                forward = 2.8
+            else:
+                forward = 0.9
         elif robot_ahead_of_ball and ball_rel[0] < 0.85:
             if near_goal_side or finish_corridor:
                 inward_scale = clamp(abs(ball[1]) / max(GOAL_HALF_WIDTH, 1e-6), 0.35, 1.0)
-                inward_offset = -0.24 * inward_scale * math.copysign(1.0, ball[1])
+                inward_offset = 0.24 * inward_scale * math.copysign(1.0, ball[1])
                 reposition = clip_to_field(
                     (ball[0] - 0.24, ball[1] + inward_offset),
                     padding=0.10,
@@ -2679,11 +3717,11 @@ class StudentController:
                     forward = 0.6 if abs(staging_angle) < 1.20 else 0.3
         elif finish_corridor:
             turn = clamp(
-                1.3 * ball_rel[1] + 1.6 * centerline_bias,
+                1.15 * ball_rel[1] + 1.65 * goal_heading_error + 0.45 * corridor_bias,
                 -RL_TURN_SCALE,
                 RL_TURN_SCALE,
             )
-            forward = 5.4 if abs(ball_rel[1]) < 0.75 and ball_rel[0] < 0.75 else 3.6
+            forward = 5.4 if abs(goal_heading_error) < 0.95 and abs(ball_rel[1]) < 0.75 and ball_rel[0] < 0.75 else 2.6
         elif ball[0] > 4.35 and abs(ball[1]) <= GOAL_HALF_WIDTH - 0.05:
             turn = clamp(
                 0.9 * ball_rel[1] + 1.6 * goal_heading_error + 0.7 * centerline_bias,
@@ -2754,7 +3792,8 @@ class StudentController:
 
 
     def should_enter_rl(self, sensors):
-        return sensors.get("ball") is not None or self._has_reliable_ball_estimate(max_age=35)
+        max_age = PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else 35
+        return sensors.get("ball") is not None or self._has_reliable_ball_estimate(max_age=max_age)
 
     def _update_rl_progress(self, pose, context):
         if self.localizer.confidence < 0.20:
@@ -2817,13 +3856,21 @@ class StudentController:
         finish_zone = False
         if ball_position is not None:
             finish_zone = distance(ball_position, self.attack_goal) < 1.8 or ball_position[0] > 3.25
-        reliable_estimate = self._has_reliable_ball_estimate(max_age=180 if finish_zone else 140)
+        reliable_max_age = PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else (180 if finish_zone else 140)
+        reliable_estimate = self._has_reliable_ball_estimate(max_age=reliable_max_age)
+        if (
+            self.motion_planner_enabled
+            and self.planner_committed_path
+            and reliable_estimate
+            and self.ball_tracker.age <= (PLANNER_BALL_MEMORY_STEPS if self.motion_planner_enabled else (220 if finish_zone else 170))
+        ):
+            return False
 
         if ball_visible:
             return False
-        if not finish_zone and self.ball_tracker.age > 14:
-            return True
         if reliable_estimate:
+            if self.motion_planner_enabled:
+                return False
             if (
                 self.low_confidence_steps >= (70 if finish_zone else 45)
                 and self.localizer.confidence < 0.08
@@ -2831,6 +3878,8 @@ class StudentController:
             ):
                 return True
             return False
+        if not finish_zone and self.ball_tracker.age > 14:
+            return True
 
         if self.ball_tracker.age > (180 if finish_zone else 140):
             return True
@@ -2952,6 +4001,7 @@ class StudentController:
             "estimated_ball": None if self.ball_tracker.position is None else [float(v) for v in self.ball_tracker.position],
             "actual_ball": truth.get("ball_position"),
             "localization": localization,
+            "motion_plan": self.last_motion_plan,
             "features": [float(v) for v in self.last_rl_features],
             "action": [float(v) for v in self.last_rl_action],
             "control": {
@@ -3006,6 +4056,7 @@ class StudentController:
             },
             "rl_features": [float(v) for v in self.last_rl_features],
             "rl_action": [float(v) for v in self.last_rl_action],
+            "motion_plan": self.last_motion_plan,
             "localization": self.last_localization_diagnostics,
         }
         self.visualizer.publish(snapshot)
