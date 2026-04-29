@@ -558,7 +558,7 @@ def _base_deepbots_env(args, trace_path=None):
         env["RL_DEEPBOTS_TRACE_PATH"] = str(trace_path)
         env["RL_TRACE_PATH"] = str(trace_path)
     if getattr(args, "weights", None):
-        env["RL_POLICY_WEIGHTS_PATH"] = str(Path(args.weights).expanduser().resolve())
+        env["E2E_POLICY_WEIGHTS_PATH"] = str(Path(args.weights).expanduser().resolve())
     if getattr(args, "actor_source", None):
         env["RL_DEEPBOTS_ACTOR_SOURCE"] = args.actor_source
     if getattr(args, "warm_start", None):
@@ -618,7 +618,7 @@ def cmd_deepbots_record(args):
             "RL_DEEPBOTS_PHASE",
             "RL_DEEPBOTS_MAX_STEPS",
             "RL_DEEPBOTS_SEED",
-            "RL_POLICY_WEIGHTS_PATH",
+            "E2E_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
         ),
@@ -707,7 +707,7 @@ def cmd_deepbots_eval(args):
             "RL_DEEPBOTS_PHASE",
             "RL_DEEPBOTS_MAX_STEPS",
             "RL_DEEPBOTS_SEED",
-            "RL_POLICY_WEIGHTS_PATH",
+            "E2E_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
         ),
