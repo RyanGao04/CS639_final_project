@@ -18,9 +18,10 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 DEEPBOTS_ROOT = ROOT / "deepbots"
+SCRIPTS_DIR = ROOT / "scripts"
 ROBOT_CONTROLLER_DIR = ROOT / "final_project" / "controllers" / "robot_one_controller"
 
-for candidate in (DEEPBOTS_ROOT, ROBOT_CONTROLLER_DIR):
+for candidate in (DEEPBOTS_ROOT, ROBOT_CONTROLLER_DIR, SCRIPTS_DIR):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
@@ -66,7 +67,7 @@ def _install_gym_compat():
 gym = _install_gym_compat()
 
 try:
-    from controller import Supervisor
+    from controller import Keyboard, Supervisor
     from deepbots.supervisor import RobotSupervisorEnv
 except Exception as exc:  # pragma: no cover - only importable inside Webots.
     raise RuntimeError(
@@ -77,6 +78,9 @@ except Exception as exc:  # pragma: no cover - only importable inside Webots.
 from starter_controller import (  # noqa: E402
     ARENA_X_HALF,
     ARENA_Y_HALF,
+    E2E_FEATURE_NAMES,
+    E2E_REVERSE_SCALE,
+    EndToEndActorPolicy,
     FIELD_X_HALF,
     FIELD_Y_HALF,
     GOAL_HALF_WIDTH,
@@ -85,7 +89,7 @@ from starter_controller import (  # noqa: E402
     RIGHT_GOAL,
     RL_FORWARD_SCALE,
     RL_TURN_SCALE,
-    EmbeddedActorPolicy,
+    StudentController,
     clamp,
     clip_to_field,
     distance,
@@ -95,10 +99,10 @@ from starter_controller import (  # noqa: E402
 )
 
 
-FEATURE_DIM = 16
+FEATURE_DIM = len(E2E_FEATURE_NAMES)
 ACTION_DIM = 2
 BALL_Z = 0.07
-RUNTIME_WEIGHTS_FILENAME = "rl_policy_weights.npz"
+RUNTIME_WEIGHTS_FILENAME = EndToEndActorPolicy.RUNTIME_WEIGHTS_FILENAME
 RUNTIME_WEIGHTS_PATH = ROBOT_CONTROLLER_DIR / RUNTIME_WEIGHTS_FILENAME
 
 
@@ -114,6 +118,13 @@ def _env_float(name, default):
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_xy(dx, dy):
@@ -162,6 +173,7 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
 
         self.robot_node = self.getFromDef("ROBOT_ONE")
         self.ball_node = self.getFromDef("BALL")
+        self.opponent_node = self.getFromDef("ROBOT_TWO")
         if self.robot_node is None or self.ball_node is None:
             raise RuntimeError("World must define ROBOT_ONE and BALL nodes.")
 
@@ -183,9 +195,18 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         self.phase = max(1, min(3, _env_int("RL_DEEPBOTS_PHASE", 2)))
         self.max_episode_steps = max(100, _env_int("RL_DEEPBOTS_MAX_STEPS", 1800))
         self.control_noise_pct = max(0.0, _env_float("RL_DEEPBOTS_CONTROL_NOISE_PCT", 0.05))
-        self.ball_range_noise_pct = max(0.0, _env_float("RL_DEEPBOTS_BALL_RANGE_NOISE_PCT", 0.02))
-        self.ball_angle_noise = max(0.0, _env_float("RL_DEEPBOTS_BALL_ANGLE_NOISE", 0.015))
+        self.object_range_noise_pct = max(0.0, _env_float("RL_DEEPBOTS_OBJECT_RANGE_NOISE_PCT", 0.0))
+        self.object_angle_noise = max(0.0, _env_float("RL_DEEPBOTS_OBJECT_ANGLE_NOISE", 0.0))
+        self.ball_range_noise_pct = max(0.0, _env_float("RL_DEEPBOTS_BALL_RANGE_NOISE_PCT", self.object_range_noise_pct))
+        self.ball_angle_noise = max(0.0, _env_float("RL_DEEPBOTS_BALL_ANGLE_NOISE", self.object_angle_noise))
+        self.odometry_noise = max(0.0, _env_float("RL_DEEPBOTS_ODOMETRY_NOISE", 0.01))
         self.ball_dropout = clamp(_env_float("RL_DEEPBOTS_BALL_DROPOUT", 0.08 if self.phase >= 3 else 0.0), 0.0, 0.9)
+        self.tournament_mirror = os.environ.get("RL_DEEPBOTS_TOURNAMENT_MIRROR", "1") != "0"
+        self.attack_sign = 1.0
+        self.prev_position = None
+        self.prev_rotation = None
+        os.environ.setdefault("WEBOTS_LIVE_VISUALIZER", "0")
+        self.belief_controller = StudentController()
 
         self.observation_space = gym.spaces.Box(
             low=-np.ones(FEATURE_DIM, dtype=np.float32),
@@ -232,9 +253,13 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
     def _wall_margin(self, pose):
         return min(ARENA_X_HALF - abs(pose[0]), ARENA_Y_HALF - abs(pose[1]))
 
+    def _attack_goal(self):
+        return self.attack_sign * RIGHT_GOAL[0], RIGHT_GOAL[1]
+
     def _staging_point(self, ball_position):
-        goal_dx = RIGHT_GOAL[0] - ball_position[0]
-        goal_dy = RIGHT_GOAL[1] - ball_position[1]
+        attack_goal = self._attack_goal()
+        goal_dx = attack_goal[0] - ball_position[0]
+        goal_dy = attack_goal[1] - ball_position[1]
         unit_x, unit_y = _normalize_xy(goal_dx, goal_dy)
         staging = (
             ball_position[0] - 0.28 * unit_x,
@@ -246,30 +271,119 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         _, angle = relative_polar(pose, point)
         return abs(angle) <= 0.5 * OBSERVATION_FOV
 
-    def _observe_ball(self, pose, ball_position):
-        visible = self._is_visible(pose, ball_position)
-        if visible and self.ball_dropout > 0.0 and self.rng.random() < self.ball_dropout:
+    def _get_polar_obs(self, pose, point, range_noise_pct=0.0, angle_noise=0.0, dropout=0.0):
+        visible = self._is_visible(pose, point)
+        if visible and dropout > 0.0 and self.rng.random() < dropout:
             visible = False
 
-        if visible:
-            dist, angle = relative_polar(pose, ball_position)
-            noisy_dist = max(
-                0.02,
-                dist + float(self.rng.normal(0.0, self.ball_range_noise_pct * max(dist, 0.5))),
-            )
-            noisy_angle = wrap_to_pi(angle + float(self.rng.normal(0.0, self.ball_angle_noise)))
-            ball_rel = (noisy_dist, noisy_angle)
-            self.ball_estimate = polar_to_world(pose, ball_rel)
-            self.last_seen_ball_rel = ball_rel
-            self.ball_age = 0
-            return 1.0, ball_rel, self.ball_estimate
+        if not visible:
+            return None
 
-        self.ball_age += 1
-        if self.ball_estimate is not None:
-            return 0.0, relative_polar(pose, self.ball_estimate), self.ball_estimate
-        if self.last_seen_ball_rel is not None:
-            return 0.0, self.last_seen_ball_rel, None
-        return 0.0, (2.0, 0.0), None
+        dist, angle = relative_polar(pose, point)
+        noisy_dist = max(
+            0.02,
+            dist + float(self.rng.normal(0.0, range_noise_pct * max(dist, 0.5))),
+        )
+        noisy_angle = wrap_to_pi(angle + float(self.rng.normal(0.0, angle_noise)))
+        return noisy_dist, noisy_angle
+
+    def _provide_odometry(self):
+        pose = self._robot_pose()
+        rotation = pose[2]
+        position = pose[:2]
+        if self.prev_position is None:
+            self.prev_position = position
+        if self.prev_rotation is None:
+            self.prev_rotation = rotation
+
+        delta_forward = math.hypot(position[0] - self.prev_position[0], position[1] - self.prev_position[1])
+        delta_rotation = rotation - self.prev_rotation
+        if abs(delta_rotation) > math.pi:
+            if rotation < 0:
+                delta_rotation = (2.0 * math.pi + rotation) - self.prev_rotation
+            else:
+                delta_rotation = rotation - (2.0 * math.pi + self.prev_rotation)
+
+        self.prev_position = position
+        self.prev_rotation = rotation
+        odometry = np.array([delta_forward, delta_rotation], dtype=np.float32)
+        if self.odometry_noise > 0.0:
+            odometry += self.rng.normal(0.0, self.odometry_noise, size=2).astype(np.float32)
+        return odometry
+
+    def _build_student_sensors(self):
+        pose = self._robot_pose()
+        ball = self._ball_position()
+        ball_obs = self._get_polar_obs(
+            pose,
+            ball,
+            range_noise_pct=self.ball_range_noise_pct,
+            angle_noise=self.ball_angle_noise,
+            dropout=self.ball_dropout,
+        )
+        goals = []
+        for goal in ((4.5, 0.0), (-4.5, 0.0)):
+            obs = self._get_polar_obs(
+                pose,
+                goal,
+                range_noise_pct=self.object_range_noise_pct,
+                angle_noise=self.object_angle_noise,
+            )
+            if obs is not None:
+                goals.append(obs)
+
+        crosses = []
+        for cross in ((3.25, 0.0), (-3.25, 0.0)):
+            obs = self._get_polar_obs(
+                pose,
+                cross,
+                range_noise_pct=self.object_range_noise_pct,
+                angle_noise=self.object_angle_noise,
+            )
+            if obs is not None:
+                crosses.append(obs)
+
+        corners = []
+        for corner in ((-4.5, 3.0), (-4.5, -3.0), (4.5, 3.0), (4.5, -3.0)):
+            obs = self._get_polar_obs(
+                pose,
+                corner,
+                range_noise_pct=self.object_range_noise_pct,
+                angle_noise=self.object_angle_noise,
+            )
+            if obs is not None:
+                corners.append(obs)
+
+        center = self._get_polar_obs(
+            pose,
+            (0.0, 0.0),
+            range_noise_pct=self.object_range_noise_pct,
+            angle_noise=self.object_angle_noise,
+        )
+
+        opponent = None
+        if self.opponent_node is not None:
+            opponent_position = self.opponent_node.getField("translation").getSFVec3f()[:2]
+            opponent = self._get_polar_obs(
+                pose,
+                opponent_position,
+                range_noise_pct=self.object_range_noise_pct,
+                angle_noise=self.object_angle_noise,
+            )
+
+        return {
+            "ball": ball_obs,
+            "goal": goals,
+            "center_circle": center,
+            "penalty_cross": crosses,
+            "corners": corners,
+            "opponent": opponent,
+            "odometry": self._provide_odometry(),
+            "debug_truth": {
+                "robot_pose": [float(pose[0]), float(pose[1]), float(pose[2])],
+                "ball_position": [float(ball[0]), float(ball[1])],
+            },
+        }
 
     def _metrics(self):
         pose = self._robot_pose()
@@ -278,17 +392,17 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
             "pose": pose,
             "ball": ball,
             "robot_to_ball": distance(pose[:2], ball),
-            "ball_to_goal": distance(ball, RIGHT_GOAL),
+            "ball_to_goal": distance(ball, self._attack_goal()),
             "wall_margin": self._wall_margin(pose),
             "correct_goal": self._is_correct_goal(ball),
             "wrong_goal": self._is_wrong_goal(ball),
         }
 
     def _is_correct_goal(self, ball):
-        return ball[0] > FIELD_X_HALF + 0.02 and abs(ball[1]) <= GOAL_HALF_WIDTH
+        return self.attack_sign * ball[0] > FIELD_X_HALF + 0.02 and abs(ball[1]) <= GOAL_HALF_WIDTH
 
     def _is_wrong_goal(self, ball):
-        return ball[0] < -FIELD_X_HALF - 0.02 and abs(ball[1]) <= GOAL_HALF_WIDTH
+        return self.attack_sign * ball[0] < -FIELD_X_HALF - 0.02 and abs(ball[1]) <= GOAL_HALF_WIDTH
 
     def _is_out_of_play(self, ball):
         return (
@@ -297,6 +411,21 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         )
 
     def _sample_initial_state(self):
+        self.attack_sign = 1.0
+        if self.phase >= 3:
+            self.attack_sign = -1.0 if self.tournament_mirror and self.rng.random() < 0.5 else 1.0
+            for _ in range(200):
+                internal_ball_x = float(self.rng.uniform(-1.25, 1.50))
+                internal_ball_y = float(self.rng.uniform(-1.50, 1.50))
+                if math.hypot(internal_ball_x + 1.0, internal_ball_y) < 0.35:
+                    continue
+                if self.attack_sign > 0.0:
+                    return (-1.0, 0.0, 0.0), (internal_ball_x, internal_ball_y)
+                return (1.0, 0.0, math.pi), (-internal_ball_x, -internal_ball_y)
+            if self.attack_sign > 0.0:
+                return (-1.0, 0.0, 0.0), (0.0, 0.0)
+            return (1.0, 0.0, math.pi), (0.0, 0.0)
+
         for _ in range(200):
             ball_x = float(self.rng.uniform(-1.3, 1.5))
             ball_y = float(self.rng.uniform(-1.5, 1.5))
@@ -352,6 +481,10 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         self.localizer_confidence = 1.0
         self.last_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self.last_control = {"left_motor": 0.0, "right_motor": 0.0}
+        self.prev_position = None
+        self.prev_rotation = None
+        self.belief_controller.close()
+        self.belief_controller = StudentController()
         self.left_motor.setVelocity(0.0)
         self.right_motor.setVelocity(0.0)
 
@@ -360,53 +493,17 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         self._place_node(self.ball_node, ball[0], ball[1], BALL_Z)
         self.simulationResetPhysics()
         super(Supervisor, self).step(self.timestep)
+        current_pose = self._robot_pose()
+        self.prev_position = current_pose[:2]
+        self.prev_rotation = current_pose[2]
 
         self._prev_metrics = self._metrics()
         self.last_observation = self.get_observations()
         return self.last_observation.copy()
 
     def get_observations(self):
-        pose = self._robot_pose()
-        ball = self._ball_position()
-        ball_visible, ball_rel, ball_estimate = self._observe_ball(pose, ball)
-
-        self.localizer_confidence = clamp(
-            1.0 - 0.025 * self.ball_age + float(self.rng.normal(0.0, 0.01 if self.phase >= 3 else 0.0)),
-            0.0,
-            1.0,
-        )
-
-        goal_rel = relative_polar(pose, RIGHT_GOAL)
-        if ball_estimate is not None:
-            staging_point = self._staging_point(ball_estimate)
-            staging_rel = relative_polar(pose, staging_point)
-            ball_goal_alignment = math.cos(wrap_to_pi(goal_rel[1] - ball_rel[1]))
-        else:
-            staging_rel = (2.0, 0.0)
-            ball_goal_alignment = -1.0
-
-        wall_margin_norm = clamp(self._wall_margin(pose) / 1.5, 0.0, 1.0)
-        features = np.array(
-            [
-                ball_visible,
-                clamp(ball_rel[0] / 2.0, 0.0, 1.0),
-                math.sin(ball_rel[1]),
-                math.cos(ball_rel[1]),
-                clamp(goal_rel[0] / 9.0, 0.0, 1.0),
-                math.sin(goal_rel[1]),
-                math.cos(goal_rel[1]),
-                clamp(staging_rel[0] / 2.0, 0.0, 1.0),
-                math.sin(staging_rel[1]),
-                math.cos(staging_rel[1]),
-                ball_goal_alignment,
-                self.localizer_confidence,
-                clamp(self.ball_age / 30.0, 0.0, 1.0),
-                clamp(self.prev_forward_cmd, -1.0, 1.0),
-                clamp(self.prev_turn_cmd, -1.0, 1.0),
-                wall_margin_norm,
-            ],
-            dtype=np.float32,
-        )
+        sensors = self._build_student_sensors()
+        features, _, _ = self.belief_controller.observe_e2e_features(sensors)
         self.last_observation = features
         return features.copy()
 
@@ -417,7 +514,7 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
 
         a_forward = clamp(float(action[0]), -1.0, 1.0)
         a_turn = clamp(float(action[1]), -1.0, 1.0)
-        forward = RL_FORWARD_SCALE * max(0.0, 0.5 * (a_forward + 1.0))
+        forward = RL_FORWARD_SCALE * a_forward if a_forward >= 0.0 else E2E_REVERSE_SCALE * a_forward
         turn = RL_TURN_SCALE * a_turn
         self.prev_forward_cmd = clamp(forward / RL_FORWARD_SCALE, -1.0, 1.0)
         self.prev_turn_cmd = clamp(turn / RL_TURN_SCALE, -1.0, 1.0)
@@ -464,21 +561,6 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         reward += 1.2 * robot_progress
         reward += 2.0 * ball_progress
 
-        features = self.last_observation
-        ball_angle = math.atan2(float(features[2]), float(features[3]))
-        goal_angle = math.atan2(float(features[5]), float(features[6]))
-        staging_error = 2.0 * float(features[7])
-        reward += 0.5 * math.exp(-4.0 * abs(ball_angle))
-        reward += 0.35 * math.exp(-2.5 * staging_error)
-        reward += 0.25 * math.exp(-2.0 * abs(goal_angle))
-
-        if features[0] < 0.5:
-            reward -= 0.2
-        if curr["wall_margin"] < 0.30 and ball_progress < 0.003:
-            reward -= 0.3
-        if abs(float(self.last_action[1])) > 0.75 and ball_progress < 0.003:
-            reward -= 0.4
-
         if curr["correct_goal"]:
             reward += 12.0
         elif curr["wrong_goal"] or (self._is_out_of_play(curr["ball"]) and not curr["correct_goal"]):
@@ -509,6 +591,7 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
             "wrong_goal": bool(metrics["wrong_goal"]),
             "ball_to_goal": float(metrics["ball_to_goal"]),
             "robot_to_ball": float(metrics["robot_to_ball"]),
+            "attack_sign": float(self.attack_sign),
         }
 
     def _log_transition(self, prev_obs, obs, reward, done, info):
@@ -517,7 +600,7 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
                 "episode": self.episode,
                 "step": self.global_step,
                 "episode_step": self.episode_step,
-                "state": "RL_BALL_PLAY",
+                "state": f"E2E_{os.environ.get('RL_DEEPBOTS_MODE', 'train').upper()}",
                 "features": [float(v) for v in prev_obs],
                 "action": [float(v) for v in self.last_action],
                 "reward": float(reward),
@@ -562,7 +645,7 @@ class GymnasiumAdapter(gym.Env):
 
 
 def _actor_arrays_from_embedded_policy():
-    policy = EmbeddedActorPolicy()
+    policy = EndToEndActorPolicy()
     return {
         "w1": np.asarray(policy.w1, dtype=np.float32),
         "b1": np.asarray(policy.b1, dtype=np.float32),
@@ -682,7 +765,7 @@ def export_sac_actor(model, output_path):
 
 
 def run_actor_loop(env):
-    actor = EmbeddedActorPolicy()
+    actor = EndToEndActorPolicy()
     obs = env.reset()
     while True:
         action = actor(obs)
@@ -697,6 +780,68 @@ def run_random_loop(env):
     while True:
         _, _, done, _ = env.step(env.action_space.sample())
         if done:
+            env.reset()
+
+
+def run_teleop_loop(env):
+    keyboard = Keyboard()
+    keyboard.enable(env.timestep)
+    obs = env.reset()
+    print(
+        "Teleop demo collection: W/Up forward, S/Down reverse, "
+        "A/Left turn left, D/Right turn right, Space stop, R reset, Q quit."
+    )
+
+    while True:
+        linear = 0.0
+        angular = 0.0
+        reset_requested = False
+        quit_requested = False
+
+        key = keyboard.getKey()
+        while key != -1:
+            if key in (Keyboard.UP, ord("W"), ord("w")):
+                linear += 0.85
+            elif key in (Keyboard.DOWN, ord("S"), ord("s")):
+                linear -= 0.60
+            elif key in (Keyboard.LEFT, ord("A"), ord("a")):
+                angular += 0.80
+            elif key in (Keyboard.RIGHT, ord("D"), ord("d")):
+                angular -= 0.80
+            elif key in (ord(" "),):
+                linear = 0.0
+                angular = 0.0
+            elif key in (ord("R"), ord("r")):
+                reset_requested = True
+            elif key in (ord("Q"), ord("q")):
+                quit_requested = True
+            key = keyboard.getKey()
+
+        if quit_requested:
+            env.close()
+            env.simulationQuit(0)
+            return
+
+        if reset_requested:
+            obs = env.reset()
+            continue
+
+        action = np.array(
+            [clamp(linear, -1.0, 1.0), clamp(angular, -1.0, 1.0)],
+            dtype=np.float32,
+        )
+        obs, reward, done, info = env.step(action)
+        del obs, reward
+        if done:
+            if info.get("correct_goal"):
+                outcome = "correct_goal"
+            elif info.get("wrong_goal"):
+                outcome = "wrong_goal"
+            elif int(info.get("episode_step", 0)) >= env.max_episode_steps:
+                outcome = "timeout"
+            else:
+                outcome = "out_of_play"
+            print(f"teleop episode done: outcome={outcome} steps={info.get('episode_step')}")
             env.reset()
 
 
@@ -720,6 +865,101 @@ def run_sac_eval(env):
         obs, _, done, _ = env.step(action)
         if done:
             obs = env.reset()
+
+
+def run_eval_loop(env):
+    policy_name = os.environ.get("RL_DEEPBOTS_EVAL_POLICY", "actor").strip().lower()
+    episodes = max(1, _env_int("RL_DEEPBOTS_EVAL_EPISODES", 20))
+    output_path = os.environ.get("RL_DEEPBOTS_EVAL_OUTPUT")
+
+    if policy_name == "sac":
+        try:
+            from stable_baselines3 import SAC
+        except ImportError as exc:
+            raise RuntimeError(
+                "stable-baselines3 is required for RL_DEEPBOTS_EVAL_POLICY=sac. "
+                "Run: python scripts/rl_workflow.py install-rl-deps"
+            ) from exc
+        model_path = os.environ.get("RL_DEEPBOTS_MODEL_PATH")
+        if not model_path:
+            raise RuntimeError("Set RL_DEEPBOTS_MODEL_PATH for SAC evaluation.")
+        model = SAC.load(model_path)
+
+        def act(observation):
+            action, _ = model.predict(observation, deterministic=True)
+            return action
+
+    elif policy_name in ("actor", "bootstrap"):
+        actor = EndToEndActorPolicy()
+
+        def act(observation):
+            if policy_name == "bootstrap":
+                return np.zeros(ACTION_DIM, dtype=np.float32)
+            return actor(observation)
+
+    else:
+        raise RuntimeError(f"Unsupported RL_DEEPBOTS_EVAL_POLICY={policy_name!r}")
+
+    results = []
+    for episode_index in range(1, episodes + 1):
+        obs = env.reset()
+        done = False
+        info = env.get_info()
+        total_reward = 0.0
+        while not done:
+            obs, reward, done, info = env.step(act(obs))
+            total_reward += float(reward)
+
+        if info.get("correct_goal"):
+            outcome = "correct_goal"
+        elif info.get("wrong_goal"):
+            outcome = "wrong_goal"
+        elif int(info.get("episode_step", 0)) >= env.max_episode_steps:
+            outcome = "timeout"
+        else:
+            outcome = "out_of_play"
+
+        results.append(
+            {
+                "episode": episode_index,
+                "outcome": outcome,
+                "episode_step": int(info.get("episode_step", 0)),
+                "return": total_reward,
+                "correct_goal": bool(info.get("correct_goal")),
+                "wrong_goal": bool(info.get("wrong_goal")),
+                "attack_sign": float(info.get("attack_sign", 1.0)),
+                "ball_position": info.get("ball_position"),
+                "robot_pose": info.get("robot_pose"),
+            }
+        )
+        print(
+            f"eval episode={episode_index}/{episodes} "
+            f"outcome={outcome} steps={results[-1]['episode_step']} "
+            f"return={total_reward:.3f}"
+        )
+
+    successes = sum(result["outcome"] == "correct_goal" for result in results)
+    wrong_goals = sum(result["outcome"] == "wrong_goal" for result in results)
+    timeouts = sum(result["outcome"] == "timeout" for result in results)
+    summary = {
+        "policy": policy_name,
+        "episodes_requested": episodes,
+        "episodes_completed": len(results),
+        "successes": successes,
+        "wrong_goals": wrong_goals,
+        "timeouts": timeouts,
+        "success_rate": successes / len(results) if results else 0.0,
+        "mean_episode_steps": float(np.mean([result["episode_step"] for result in results])) if results else 0.0,
+        "results": results,
+    }
+    if output_path:
+        path = Path(output_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"Wrote eval summary to {path}")
+
+    env.close()
+    env.simulationQuit(0)
 
 
 def run_sac_training(env):
@@ -789,6 +1029,252 @@ def run_sac_training(env):
     env.simulationQuit(0)
 
 
+def _serl_demo_patterns():
+    raw = os.environ.get("RL_DEEPBOTS_DEMO_TRACES", "")
+    return [item for item in raw.split(os.pathsep) if item]
+
+
+def _serl_transition(obs, action, next_obs, reward, done):
+    return {
+        "observations": np.asarray(obs, dtype=np.float32),
+        "actions": np.asarray(action, dtype=np.float32),
+        "next_observations": np.asarray(next_obs, dtype=np.float32),
+        "rewards": np.float32(reward),
+        "masks": np.float32(0.0 if done else 1.0),
+        "dones": bool(done),
+    }
+
+
+def _save_serl_actor(agent, unfreeze, actor_arrays_from_params, output_path):
+    params = unfreeze(agent.state.params)
+    arrays = actor_arrays_from_params(params, FEATURE_DIM)
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+    print(f"Exported SERL E2E runtime actor weights to {path}")
+
+
+def _serl_update(agent, replay_buffer, jax, jnp, tree_to_jax, total_batch_size, utd_ratio):
+    batch = replay_buffer.sample(batch_size=total_batch_size)
+    batch = tree_to_jax(jax, jnp, batch)
+    return agent.update_high_utd(batch, utd_ratio=utd_ratio)
+
+
+def _concat_serl_batches(jax, jnp, first_batch, second_batch):
+    tree_map = getattr(jax, "tree_map", None)
+    if tree_map is None:
+        tree_map = jax.tree_util.tree_map
+    return tree_map(lambda first, second: jnp.concatenate((first, second), axis=0), first_batch, second_batch)
+
+
+def _serl_mixed_update(
+    agent,
+    replay_buffer,
+    demo_buffer,
+    jax,
+    jnp,
+    tree_to_jax,
+    online_batch_size,
+    demo_batch_size,
+    utd_ratio,
+):
+    online_batch = tree_to_jax(jax, jnp, replay_buffer.sample(batch_size=online_batch_size))
+    if demo_buffer is None or demo_batch_size <= 0:
+        batch = online_batch
+    else:
+        demo_batch = tree_to_jax(jax, jnp, demo_buffer.sample(batch_size=demo_batch_size))
+        batch = _concat_serl_batches(jax, jnp, online_batch, demo_batch)
+    return agent.update_high_utd(batch, utd_ratio=utd_ratio)
+
+
+def run_serl_training(env):
+    try:
+        from serl_e2e_train import (
+            _actor_arrays_from_params,
+            _collect_trace_files,
+            _create_agent,
+            _import_serl,
+            _insert_transitions,
+            _load_transitions,
+            _tree_to_jax,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "SERL training support is missing. Run through a Python environment "
+            "that can import scripts/serl_e2e_train.py and SERL/JAX."
+        ) from exc
+
+    serl_root = Path(os.environ.get("SERL_ROOT", "~/serl")).expanduser()
+    gym_serl, nn, jax, jnp, serl_unfreeze, SACAgent, ReplayBuffer = _import_serl(serl_root)
+    unfreeze = serl_unfreeze
+
+    demo_patterns = _serl_demo_patterns()
+    demo_files = _collect_trace_files(demo_patterns) if demo_patterns else []
+    success_only = _env_bool("RL_DEEPBOTS_DEMO_SUCCESS_ONLY", False)
+    demo_transitions = _load_transitions(demo_files, FEATURE_DIM, success_only=success_only) if demo_files else []
+    if not demo_transitions and not _env_bool("RL_DEEPBOTS_ALLOW_EMPTY_DEMOS", False):
+        raise RuntimeError(
+            "SERL online training needs teleop demos for sample efficiency. "
+            "Set RL_DEEPBOTS_DEMO_TRACES or RL_DEEPBOTS_ALLOW_EMPTY_DEMOS=1."
+        )
+
+    total_steps = max(1, _env_int("RL_DEEPBOTS_TOTAL_STEPS", 50000))
+    batch_size = max(16, _env_int("RL_DEEPBOTS_BATCH_SIZE", 256))
+    utd_ratio = max(1, _env_int("RL_DEEPBOTS_UTD_RATIO", 8))
+    total_update_batch_size = batch_size * utd_ratio
+    online_batch_size = total_update_batch_size
+    demo_batch_size = 0
+    if demo_transitions:
+        online_batch_size = max(1, total_update_batch_size // 2)
+        demo_batch_size = total_update_batch_size - online_batch_size
+
+    replay_capacity = max(
+        _env_int("RL_DEEPBOTS_BUFFER_SIZE", 200000),
+        total_steps + total_update_batch_size,
+    )
+    demo_capacity = max(
+        len(demo_transitions),
+        demo_batch_size,
+        total_update_batch_size,
+    )
+    pretrain_steps = max(0, _env_int("RL_DEEPBOTS_SERL_PRETRAIN_STEPS", 500 if demo_transitions else 0))
+    learning_starts = max(0, _env_int("RL_DEEPBOTS_LEARNING_STARTS", online_batch_size if demo_transitions else total_update_batch_size))
+    random_steps = max(0, _env_int("RL_DEEPBOTS_RANDOM_STEPS", 0 if demo_transitions else 1000))
+    update_every = max(1, _env_int("RL_DEEPBOTS_UPDATE_EVERY", 1))
+    updates_per_step = max(1, _env_int("RL_DEEPBOTS_UPDATES_PER_STEP", 1))
+    log_period = max(1, _env_int("RL_DEEPBOTS_LOG_PERIOD", 100))
+    export_path = os.environ.get("RL_DEEPBOTS_EXPORT_PATH", str(RUNTIME_WEIGHTS_PATH))
+
+    obs_space = gym_serl.spaces.Box(
+        low=-np.ones(FEATURE_DIM, dtype=np.float32),
+        high=np.ones(FEATURE_DIM, dtype=np.float32),
+        shape=(FEATURE_DIM,),
+        dtype=np.float32,
+    )
+    action_space = gym_serl.spaces.Box(
+        low=-np.ones(ACTION_DIM, dtype=np.float32),
+        high=np.ones(ACTION_DIM, dtype=np.float32),
+        shape=(ACTION_DIM,),
+        dtype=np.float32,
+    )
+    replay_buffer = ReplayBuffer(obs_space, action_space, capacity=replay_capacity)
+    demo_buffer = None
+    if demo_transitions:
+        demo_buffer = ReplayBuffer(obs_space, action_space, capacity=demo_capacity)
+        _insert_transitions(demo_buffer, demo_transitions)
+    print(
+        "SERL online training: "
+        f"demos={len(demo_transitions)} files={len(demo_files)} "
+        f"steps={total_steps} batch={batch_size} utd={utd_ratio} "
+        f"online_batch={online_batch_size} demo_batch={demo_batch_size} "
+        f"replay_capacity={replay_capacity} demo_capacity={demo_capacity}"
+    )
+
+    agent = _create_agent(
+        SACAgent,
+        nn,
+        jax,
+        FEATURE_DIM,
+        seed=_env_int("RL_DEEPBOTS_SEED", 7),
+        lr=_env_float("RL_DEEPBOTS_LR", 3e-4),
+        gamma=_env_float("RL_DEEPBOTS_GAMMA", 0.995),
+        critic_ensemble_size=max(1, _env_int("RL_DEEPBOTS_CRITIC_ENSEMBLE_SIZE", 10)),
+        critic_subsample_size=max(1, _env_int("RL_DEEPBOTS_CRITIC_SUBSAMPLE_SIZE", 2)),
+    )
+
+    for update_step in range(1, pretrain_steps + 1):
+        if demo_buffer is None:
+            break
+        agent, info = _serl_update(agent, demo_buffer, jax, jnp, _tree_to_jax, total_update_batch_size, utd_ratio)
+        if update_step == 1 or update_step % log_period == 0:
+            scalar_info = {
+                key: float(np.asarray(value))
+                for key, value in info.items()
+                if np.asarray(value).shape == ()
+            }
+            print(f"serl pretrain update={update_step}: {json.dumps(scalar_info, sort_keys=True)}")
+
+    rng = jax.random.PRNGKey(_env_int("RL_DEEPBOTS_SEED", 7) + 1009)
+    obs = env.reset()
+    episode_return = 0.0
+    episode_count = 0
+    update_count = pretrain_steps
+    last_info = {}
+
+    for step in range(1, total_steps + 1):
+        if step <= random_steps:
+            action = env.action_space.sample()
+        else:
+            rng, action_key = jax.random.split(rng)
+            action = np.asarray(
+                agent.sample_actions(jnp.asarray(obs[None, :]), seed=action_key)[0],
+                dtype=np.float32,
+            )
+            action = np.clip(action, -1.0, 1.0)
+
+        next_obs, reward, done, info = env.step(action)
+        replay_buffer.insert(_serl_transition(obs, action, next_obs, reward, done))
+        episode_return += float(reward)
+        last_info = info
+
+        if step >= learning_starts and len(replay_buffer) >= online_batch_size and step % update_every == 0:
+            for _ in range(updates_per_step):
+                agent, train_info = _serl_mixed_update(
+                    agent,
+                    replay_buffer,
+                    demo_buffer,
+                    jax,
+                    jnp,
+                    _tree_to_jax,
+                    online_batch_size,
+                    demo_batch_size,
+                    utd_ratio,
+                )
+                update_count += 1
+        else:
+            train_info = {}
+
+        if done:
+            episode_count += 1
+            if info.get("correct_goal"):
+                outcome = "correct_goal"
+            elif info.get("wrong_goal"):
+                outcome = "wrong_goal"
+            elif int(info.get("episode_step", 0)) >= env.max_episode_steps:
+                outcome = "timeout"
+            else:
+                outcome = "out_of_play"
+            print(
+                f"serl episode={episode_count} outcome={outcome} "
+                f"steps={info.get('episode_step')} return={episode_return:.3f} "
+                f"online_replay={len(replay_buffer)} "
+                f"demo_replay={0 if demo_buffer is None else len(demo_buffer)} "
+                f"updates={update_count}"
+            )
+            obs = env.reset()
+            episode_return = 0.0
+        else:
+            obs = next_obs
+
+        if step == 1 or step % log_period == 0:
+            scalar_info = {
+                key: float(np.asarray(value))
+                for key, value in train_info.items()
+                if np.asarray(value).shape == ()
+            }
+            print(
+                f"serl step={step}/{total_steps} online_replay={len(replay_buffer)} "
+                f"demo_replay={0 if demo_buffer is None else len(demo_buffer)} "
+                f"updates={update_count} last_reward={float(reward):.3f} "
+                f"ball_to_goal={float(last_info.get('ball_to_goal', 0.0)):.3f} "
+                f"info={json.dumps(scalar_info, sort_keys=True)}"
+            )
+
+    _save_serl_actor(agent, unfreeze, _actor_arrays_from_params, export_path)
+    env.close()
+    env.simulationQuit(0)
+
+
 def main():
     env = SoccerSoloDeepbotsEnv()
     mode = os.environ.get("RL_DEEPBOTS_MODE", "actor").strip().lower()
@@ -797,8 +1283,14 @@ def main():
             run_actor_loop(env)
         elif mode == "random":
             run_random_loop(env)
+        elif mode == "teleop":
+            run_teleop_loop(env)
+        elif mode == "eval":
+            run_eval_loop(env)
         elif mode == "sac_train":
             run_sac_training(env)
+        elif mode == "serl_train":
+            run_serl_training(env)
         elif mode == "sac_eval":
             run_sac_eval(env)
         else:

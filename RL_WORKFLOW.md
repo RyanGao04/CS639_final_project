@@ -22,13 +22,39 @@ Important runtime files:
 
 ```text
 final_project/controllers/robot_one_controller/starter_controller.py
-final_project/controllers/robot_one_controller/rl_policy_weights.npz
+final_project/controllers/robot_one_controller/e2e_rl_policy_weights.npz
 tmp/rl_traces/
 tmp/rl_checkpoints/
 tmp/rl_eval/
 ```
 
-`rl_policy_weights.npz` is optional at runtime. If it is missing or invalid, `starter_controller.py` falls back to the embedded bootstrap actor and the geometric RL prior.
+`e2e_rl_policy_weights.npz` is optional at runtime. The default submission path still uses the existing heuristic controller unless `RL_POLICY_MODE=e2e` is set. If E2E mode is enabled and the weights file is missing or invalid, the E2E actor is a zero-action placeholder and should not be used for scoring runs.
+
+## Tournament-Aware E2E RL Path
+
+The new E2E policy path is:
+
+```text
+noisy relative sensors -> localizer / ball tracker / belief encoder -> one RL policy -> wheel action
+```
+
+Enable it explicitly:
+
+```bash
+RL_POLICY_MODE=e2e .venv/bin/python scripts/rl_workflow.py deepbots-eval \
+  --policy actor \
+  --episodes 20 \
+  --name e2e_probe \
+  --trace
+```
+
+The E2E actor observation is a fixed 35-dimensional belief vector. It removes the old `orbit/align/push` mode one-hot features and adds opponent-aware tournament features. Training/evaluation harnesses now build observations by generating the same relative polar sensor dictionary used by the assignment wrapper, then calling `StudentController.observe_e2e_features()`.
+
+Deepbots phase 3 samples the assignment-style start pose and, by default, mirrors half of episodes to represent the tournament robot starting on the opposite side. Disable mirrored tournament starts with:
+
+```bash
+RL_DEEPBOTS_TOURNAMENT_MIRROR=0 ...
+```
 
 ## Recommended Validation Command
 
@@ -50,20 +76,9 @@ correct-goal success rate > 95%
 wrong goals = 0
 ```
 
-The latest validated run was:
-
-```text
-eval_actor_residual_blend0
-successes = 48/50
-success_rate = 0.96
-wrong_goals = 0
-```
-
-Summary file:
-
-```text
-tmp/rl_eval/eval_actor_residual_blend0_summary.json
-```
+There is not yet a validated SERL-trained E2E policy. Treat any newly exported
+`e2e_rl_policy_weights.npz` as experimental until it passes the 50-episode
+evaluation gate above.
 
 ## Localization Robustness Workflow
 
@@ -110,40 +125,40 @@ Current localization gates:
 
 ## Controller Design
 
-High-level FSM remains:
+Default submission behavior still uses the heuristic FSM:
 
 ```text
 SEARCH_BALL -> RL_BALL_PLAY -> RECOVER
 ```
 
-Inside `RL_BALL_PLAY`, the controller uses an RL-style submode:
+When `RL_POLICY_MODE=e2e` is enabled, the FSM action logic is bypassed:
 
 ```text
-orbit -> align -> push
+noisy sensors -> belief features -> E2E actor -> wheel command
 ```
 
-The actor observation is now 19-dimensional:
+The E2E actor observation is 35-dimensional:
 
 ```text
-16 belief features + 3 submode one-hot features
+belief pose/ball/goal geometry + localization confidence + opponent features
 ```
 
-Default deployed behavior is residual-safe:
+Default deployed behavior remains heuristic-safe:
 
 ```text
-final_action = geometric_rl_prior
+RL_POLICY_MODE unset -> geometric/FSM controller
 ```
 
-You can enable neural residual correction during experiments:
+Enable the full-game E2E actor only after training a validated runtime weights file:
 
 ```bash
-RL_RESIDUAL_BLEND=0.05 .venv/bin/python scripts/rl_workflow.py deepbots-eval \
+RL_POLICY_MODE=e2e .venv/bin/python scripts/rl_workflow.py deepbots-eval \
   --policy actor \
   --episodes 50 \
-  --name eval_residual_005
+  --name eval_e2e_runtime
 ```
 
-Keep `RL_RESIDUAL_BLEND=0.0` for the stable baseline unless a new residual actor has been validated.
+If `RL_POLICY_MODE=e2e` is set without valid `e2e_rl_policy_weights.npz`, the actor returns zero actions.
 
 ## Install Dependencies
 
@@ -200,6 +215,135 @@ Evaluate an SB3 SAC model:
 
 ## Generate Expert Data
 
+The preferred demo source is now manual keyboard teleoperation, because the
+current heuristic is not strong enough to be a reliable expert.
+
+Collect keyboard demos through the deepbots harness:
+
+```bash
+.venv/bin/python scripts/rl_workflow.py deepbots-teleop manual_v1 \
+  --phase 3 \
+  --webots-mode realtime
+```
+
+Convenience wrapper:
+
+```bash
+.venv/bin/python scripts/collect_teleop_demos.py manual_v1
+```
+
+Controls:
+
+```text
+W/Up: forward
+S/Down: reverse
+A/Left: turn left
+D/Right: turn right
+Space: stop
+R: reset episode
+Q: quit
+```
+
+Teleop traces are written to `tmp/rl_traces/*_teleop.jsonl`. Each transition
+uses the same 35-dimensional E2E belief vector as runtime evaluation, generated
+through the noisy sensor -> localizer -> ball tracker path.
+
+Summarize manual traces:
+
+```bash
+.venv/bin/python scripts/rl_workflow.py trace-summary \
+  tmp/rl_traces/manual_v1_teleop.jsonl
+```
+
+## SERL E2E Training
+
+Use `~/serl` as the training framework, run online RL inside Webots, and export
+a runtime NumPy actor:
+
+```bash
+.venv/bin/python scripts/rl_workflow.py deepbots-serl-train \
+  'tmp/rl_traces/*teleop*.jsonl' \
+  --serl-root ~/serl \
+  --python /path/to/serl/env/bin/python \
+  --timesteps 50000 \
+  --batch-size 256 \
+  --utd-ratio 8
+```
+
+Convenience wrapper:
+
+```bash
+.venv/bin/python scripts/train_serl_from_teleop.py \
+  'tmp/rl_traces/*teleop*.jsonl' \
+  --serl-python /path/to/serl/env/bin/python
+```
+
+This wrapper launches online SERL training in Webots by default. Teleop demos
+go into a separate demo buffer, online rollouts go into the online replay
+buffer, and each SERL/RLPD update samples a mixed batch from both buffers.
+
+The online reward is intentionally simple: small time penalty, robot-to-ball
+progress, ball-to-correct-goal progress, and terminal correct/wrong goal
+rewards. It does not use a learned reward classifier.
+
+To render Webots during the online training process:
+
+```bash
+.venv/bin/python scripts/train_serl_from_teleop.py \
+  'tmp/rl_traces/*teleop*.jsonl' \
+  --serl-python /path/to/serl/env/bin/python \
+  --render
+```
+
+To visually inspect the exported policy after training:
+
+```bash
+.venv/bin/python scripts/train_serl_from_teleop.py \
+  'tmp/rl_traces/*teleop*.jsonl' \
+  --serl-python /path/to/serl/env/bin/python \
+  --render-after
+```
+
+The old demo-only SERL update is still available for quick pretraining checks,
+but it is not the full online RL loop:
+
+```bash
+.venv/bin/python scripts/train_serl_from_teleop.py \
+  'tmp/rl_traces/*teleop*.jsonl' \
+  --serl-python /path/to/serl/env/bin/python \
+  --offline-pretrain-only
+```
+
+This runs a SERL SAC/RLPD-style update with demo replay, high UTD updates, and
+an ensemble critic, then writes:
+
+```text
+final_project/controllers/robot_one_controller/e2e_rl_policy_weights.npz
+```
+
+If the local `.venv` does not have JAX/SERL installed, pass the Python
+interpreter from the SERL environment with `--python` or `SERL_PYTHON`. The
+workflow wrapper prints the underlying command with:
+
+```bash
+.venv/bin/python scripts/rl_workflow.py serl-train --dry-run
+```
+
+After training, evaluate with E2E mode enabled:
+
+```bash
+RL_POLICY_MODE=e2e .venv/bin/python scripts/rl_workflow.py deepbots-eval \
+  --policy actor \
+  --episodes 50 \
+  --name eval_serl_e2e \
+  --trace
+```
+
+## Legacy Expert Data
+
+The following commands are still available for comparison, but should not be
+treated as the primary demo source until the heuristic is stronger.
+
 Record expert/prior trajectories:
 
 ```bash
@@ -225,9 +369,9 @@ Summarize traces:
   tmp/rl_traces/expert_v1_deepbots.jsonl
 ```
 
-## Behavior Cloning
+## Legacy Behavior Cloning
 
-Train a 19-dimensional actor from traces and activate it:
+Train a 35-dimensional E2E actor from traces and activate it:
 
 ```bash
 .venv/bin/python scripts/rl_workflow.py train-activate \
@@ -254,7 +398,7 @@ Deactivate runtime weights and fall back to embedded weights:
 .venv/bin/python scripts/rl_workflow.py deactivate
 ```
 
-## SAC Training
+## Legacy SB3 SAC Training
 
 SAC training runs inside Webots through:
 
@@ -351,10 +495,10 @@ If a training run writes a bad runtime actor, restore a known checkpoint:
   tmp/rl_checkpoints/bc_expert_v6_mode_uniform.pt
 ```
 
-If you want the safest current behavior, set:
+If you want the safest current behavior, leave E2E mode disabled:
 
 ```bash
-export RL_RESIDUAL_BLEND=0.0
+unset RL_POLICY_MODE
 ```
 
 Runtime/config files generated for Webots Python setup are ignored by git:

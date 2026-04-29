@@ -1,4 +1,4 @@
-"""Train a 16->64->64->2 tanh actor from RL trace JSONL files."""
+"""Train an E2E belief-feature 64->64->2 tanh actor from RL trace JSONL files."""
 
 import argparse
 import json
@@ -10,12 +10,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from starter_controller import E2E_INPUT_DIM
+
 
 FIELD_X_HALF = 4.5
 GOAL_HALF_WIDTH = 0.8
 RIGHT_GOAL = np.array([4.5, 0.0], dtype=np.float32)
 LEFT_GOAL = np.array([-4.5, 0.0], dtype=np.float32)
-FEATURE_DIM = 16
+FEATURE_DIM = E2E_INPUT_DIM
 
 
 def _as_np_xy(value):
@@ -74,14 +76,16 @@ def _compute_step_reward(prev_row, row):
         reward -= 0.05
 
     ball_visible = float(features[0])
-    ball_angle = _angle_from_sin_cos(features[2], features[3])
-    goal_angle = _angle_from_sin_cos(features[5], features[6])
-    staging_dist = 2.0 * float(features[7])
-    wall_margin_norm = float(features[15])
+    ball_angle = _angle_from_sin_cos(features[3], features[4])
+    goal_angle = _angle_from_sin_cos(features[12], features[13])
+    behind_score = float(features[19])
+    lateral_error = abs(float(features[20]))
+    wall_margin_norm = float(features[28])
 
     reward += 0.5 * math.exp(-4.0 * abs(ball_angle))
-    reward += 0.35 * math.exp(-2.5 * staging_dist)
     reward += 0.25 * math.exp(-2.0 * abs(goal_angle))
+    reward += 0.25 * max(0.0, behind_score)
+    reward -= 0.15 * lateral_error
 
     if ball_visible < 0.5:
         reward -= 0.2

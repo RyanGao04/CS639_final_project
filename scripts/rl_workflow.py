@@ -19,7 +19,18 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER_DIR = ROOT / "final_project" / "controllers" / "robot_one_controller"
 TRAIN_SCRIPT = CONTROLLER_DIR / "train_rl_actor_from_traces.py"
-RUNTIME_WEIGHTS_PATH = CONTROLLER_DIR / "rl_policy_weights.npz"
+SERL_TRAIN_SCRIPT = ROOT / "scripts" / "serl_e2e_train.py"
+sys.path.insert(0, str(CONTROLLER_DIR))
+try:
+    from starter_controller import E2E_INPUT_DIM, EndToEndActorPolicy
+except Exception:
+    E2E_INPUT_DIM = 35
+
+    class EndToEndActorPolicy:
+        RUNTIME_WEIGHTS_FILENAME = "e2e_rl_policy_weights.npz"
+
+
+RUNTIME_WEIGHTS_PATH = CONTROLLER_DIR / EndToEndActorPolicy.RUNTIME_WEIGHTS_FILENAME
 TRACE_DIR = ROOT / "tmp" / "rl_traces"
 CHECKPOINT_DIR = ROOT / "tmp" / "rl_checkpoints"
 EVAL_DIR = ROOT / "tmp" / "rl_eval"
@@ -32,7 +43,7 @@ DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS = 6000
 
 
 EXPECTED_SHAPES = {
-    "w1": (64, 19),
+    "w1": (64, E2E_INPUT_DIM),
     "b1": (64,),
     "w2": (64, 64),
     "b2": (64,),
@@ -102,9 +113,10 @@ def _webots_command(webots_bin, world_path, mode=None, batch=False):
     return cmd
 
 
-def _ensure_deepbots_runtime_ini():
+def _ensure_deepbots_runtime_ini(env=None):
     controller_dir = DEEPBOTS_CONTROLLER.parent
-    python_command = Path(sys.executable).absolute()
+    env = env or os.environ
+    python_command = Path(env.get("WEBOTS_CONTROLLER_PYTHON", sys.executable)).expanduser().absolute()
     content = f"[python]\nCOMMAND = {python_command}\n"
     written = []
     for filename in ("runtime.ini", "config.ini"):
@@ -126,7 +138,7 @@ def _launch_webots(args, env, world):
     if not world_path.exists():
         raise SystemExit(f"World file not found: {world_path}")
     if "RL_DEEPBOTS_MODE" in env:
-        runtime_paths = _ensure_deepbots_runtime_ini()
+        runtime_paths = _ensure_deepbots_runtime_ini(env)
         print(f"Deepbots Python config: {', '.join(str(path) for path in runtime_paths)}")
 
     launch_cmd = _webots_command(
@@ -448,6 +460,54 @@ def cmd_train(args):
     return 0
 
 
+def cmd_serl_train(args):
+    traces = args.traces or [str(args.trace_dir / "*teleop*.jsonl")]
+    trace_files = _collect_trace_files(traces, args.trace_dir)
+    if not trace_files and not args.dry_run:
+        raise SystemExit("No trace files found.")
+
+    output_path = Path(args.output).expanduser().resolve() if args.output else RUNTIME_WEIGHTS_PATH
+    python_bin = str(Path(args.python).expanduser()) if args.python else sys.executable
+    cmd = [
+        python_bin,
+        str(SERL_TRAIN_SCRIPT),
+        *[str(path) for path in (trace_files or traces)],
+        "--serl-root",
+        str(Path(args.serl_root).expanduser()),
+        "--output",
+        str(output_path),
+        "--steps",
+        str(args.steps),
+        "--batch-size",
+        str(args.batch_size),
+        "--utd-ratio",
+        str(args.utd_ratio),
+        "--lr",
+        str(args.lr),
+        "--gamma",
+        str(args.gamma),
+        "--seed",
+        str(args.seed),
+        "--capacity",
+        str(args.capacity),
+        "--critic-ensemble-size",
+        str(args.critic_ensemble_size),
+        "--critic-subsample-size",
+        str(args.critic_subsample_size),
+        "--log-period",
+        str(args.log_period),
+    ]
+    if args.success_only:
+        cmd.append("--success-only")
+
+    print(f"Running SERL E2E training: {' '.join(cmd)}")
+    if args.dry_run:
+        return 0
+    subprocess.run(cmd, cwd=ROOT, check=True)
+    print(f"SERL E2E runtime weights: {output_path}")
+    return 0
+
+
 def cmd_activate(args):
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve() if args.output else RUNTIME_WEIGHTS_PATH
@@ -485,9 +545,16 @@ def _deepbots_trace_path(args, suffix="deepbots", run_name=None):
 
 def _base_deepbots_env(args, trace_path=None):
     env = os.environ.copy()
-    python_bin_dir = Path(sys.executable).resolve().parent
+    controller_python = getattr(args, "controller_python", None) or getattr(args, "python", None)
+    controller_python_override = bool(controller_python)
+    if controller_python:
+        controller_python = str(Path(controller_python).expanduser().resolve())
+        env["WEBOTS_CONTROLLER_PYTHON"] = controller_python
+    else:
+        controller_python = sys.executable
+    python_bin_dir = Path(controller_python).resolve().parent
     env["PATH"] = f"{python_bin_dir}{os.pathsep}{env.get('PATH', '')}"
-    site_paths = [path for path in site.getsitepackages() if Path(path).exists()]
+    site_paths = [] if controller_python_override else [path for path in site.getsitepackages() if Path(path).exists()]
     if site_paths:
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = os.pathsep.join(site_paths + ([existing_pythonpath] if existing_pythonpath else []))
@@ -562,6 +629,33 @@ def cmd_deepbots_record(args):
             "RL_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
+        ),
+    )
+    return 0
+
+
+def cmd_deepbots_teleop(args):
+    run_name = _normalize_name(args.name or _timestamp())
+    trace_path = _deepbots_trace_path(args, suffix="teleop", run_name=run_name)
+    env = _base_deepbots_env(args, trace_path=trace_path)
+    env["RL_DEEPBOTS_MODE"] = "teleop"
+
+    print("Deepbots mode: teleop")
+    print(f"Trace file: {trace_path}")
+    print("Controls: W/Up forward, S/Down reverse, A/Left, D/Right, Space stop, R reset, Q quit.")
+
+    if args.launch_webots:
+        return _launch_webots(args, env, args.world)
+
+    _print_env_exports(
+        env,
+        (
+            "RL_DEEPBOTS_MODE",
+            "RL_DEEPBOTS_TRACE_PATH",
+            "RL_TRACE_PATH",
+            "RL_DEEPBOTS_PHASE",
+            "RL_DEEPBOTS_MAX_STEPS",
+            "RL_DEEPBOTS_SEED",
         ),
     )
     return 0
@@ -701,6 +795,84 @@ def cmd_deepbots_train(args):
             "RL_DEEPBOTS_LR",
             "RL_DEEPBOTS_GAMMA",
             "RL_DEEPBOTS_TENSORBOARD_DIR",
+        ),
+    )
+    return 0
+
+
+def cmd_deepbots_serl_train(args):
+    run_name = _normalize_name(args.name or _timestamp())
+    trace_path = _deepbots_trace_path(args, suffix="serl_train", run_name=run_name)
+    output_path = Path(args.output).expanduser().resolve() if args.output else RUNTIME_WEIGHTS_PATH
+    if not args.demo_traces:
+        args.demo_traces = [args.trace_dir / "*teleop*.jsonl"]
+
+    env = _base_deepbots_env(args, trace_path=trace_path)
+    env["RL_DEEPBOTS_MODE"] = "serl_train"
+    env["RL_DEEPBOTS_TOTAL_STEPS"] = str(args.timesteps)
+    env["RL_DEEPBOTS_EXPORT_PATH"] = str(output_path)
+    env["SERL_ROOT"] = str(Path(args.serl_root).expanduser())
+    env["RL_DEEPBOTS_BATCH_SIZE"] = str(args.batch_size)
+    env["RL_DEEPBOTS_UTD_RATIO"] = str(args.utd_ratio)
+    env["RL_DEEPBOTS_LR"] = str(args.lr)
+    env["RL_DEEPBOTS_GAMMA"] = str(args.gamma)
+    env["RL_DEEPBOTS_BUFFER_SIZE"] = str(args.capacity)
+    env["RL_DEEPBOTS_CRITIC_ENSEMBLE_SIZE"] = str(args.critic_ensemble_size)
+    env["RL_DEEPBOTS_CRITIC_SUBSAMPLE_SIZE"] = str(args.critic_subsample_size)
+    env["RL_DEEPBOTS_SERL_PRETRAIN_STEPS"] = str(args.pretrain_steps)
+    env["RL_DEEPBOTS_UPDATE_EVERY"] = str(args.update_every)
+    env["RL_DEEPBOTS_UPDATES_PER_STEP"] = str(args.updates_per_step)
+    env["RL_DEEPBOTS_RANDOM_STEPS"] = str(args.random_steps)
+    env["RL_DEEPBOTS_LOG_PERIOD"] = str(args.log_period)
+    if args.learning_starts is not None:
+        env["RL_DEEPBOTS_LEARNING_STARTS"] = str(args.learning_starts)
+    if args.success_only:
+        env["RL_DEEPBOTS_DEMO_SUCCESS_ONLY"] = "1"
+    if args.allow_empty_demos:
+        env["RL_DEEPBOTS_ALLOW_EMPTY_DEMOS"] = "1"
+
+    print("Deepbots mode: serl_train")
+    print(f"Transition trace: {trace_path}")
+    print(f"Runtime export: {output_path}")
+    if "WEBOTS_CONTROLLER_PYTHON" in env:
+        print(f"Webots controller Python: {env['WEBOTS_CONTROLLER_PYTHON']}")
+    if "RL_DEEPBOTS_DEMO_TRACES" in env:
+        print(f"Teleop demo traces: {env['RL_DEEPBOTS_DEMO_TRACES']}")
+    print(f"SERL root: {env['SERL_ROOT']}")
+
+    if args.launch_webots:
+        return _launch_webots(args, env, args.world)
+
+    _print_env_exports(
+        env,
+        (
+            "WEBOTS_CONTROLLER_PYTHON",
+            "SERL_ROOT",
+            "RL_DEEPBOTS_MODE",
+            "RL_DEEPBOTS_TRACE_PATH",
+            "RL_TRACE_PATH",
+            "RL_DEEPBOTS_PHASE",
+            "RL_DEEPBOTS_MAX_STEPS",
+            "RL_DEEPBOTS_SEED",
+            "RL_DEEPBOTS_TOTAL_STEPS",
+            "RL_DEEPBOTS_EXPORT_PATH",
+            "RL_DEEPBOTS_DEMO_TRACES",
+            "RL_DEEPBOTS_DEMO_SUCCESS_ONLY",
+            "RL_DEEPBOTS_ALLOW_EMPTY_DEMOS",
+            "RL_DEEPBOTS_BATCH_SIZE",
+            "RL_DEEPBOTS_UTD_RATIO",
+            "RL_DEEPBOTS_LR",
+            "RL_DEEPBOTS_GAMMA",
+            "RL_DEEPBOTS_BUFFER_SIZE",
+            "RL_DEEPBOTS_CRITIC_ENSEMBLE_SIZE",
+            "RL_DEEPBOTS_CRITIC_SUBSAMPLE_SIZE",
+            "RL_DEEPBOTS_SERL_PRETRAIN_STEPS",
+            "RL_DEEPBOTS_LEARNING_STARTS",
+            "RL_DEEPBOTS_RANDOM_STEPS",
+            "RL_DEEPBOTS_UPDATE_EVERY",
+            "RL_DEEPBOTS_UPDATES_PER_STEP",
+            "RL_DEEPBOTS_LOG_PERIOD",
+            "RL_DEEPBOTS_TERMINATE_OUT_OF_PLAY",
         ),
     )
     return 0
@@ -1395,6 +1567,22 @@ def build_parser():
     deepbots_record.set_defaults(launch_webots=True)
     deepbots_record.set_defaults(func=cmd_deepbots_record)
 
+    deepbots_teleop = subparsers.add_parser("deepbots-teleop", help="Collect E2E demos with keyboard teleoperation.")
+    deepbots_teleop.add_argument("name", nargs="?", help="Trace run name.")
+    deepbots_teleop.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    deepbots_teleop.add_argument("--phase", type=int, default=3, help="Curriculum phase used by the deepbots reset sampler.")
+    deepbots_teleop.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_teleop.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
+    deepbots_teleop.add_argument("--seed", type=int, default=7)
+    deepbots_teleop.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
+    deepbots_teleop.add_argument("--webots-bin", help="Path to the Webots executable.")
+    deepbots_teleop.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="realtime", help="Webots run mode.")
+    deepbots_teleop.add_argument("--batch", action="store_true", default=False, help="Launch Webots in batch mode.")
+    deepbots_teleop.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
+    deepbots_teleop.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
+    deepbots_teleop.set_defaults(launch_webots=True)
+    deepbots_teleop.set_defaults(func=cmd_deepbots_teleop)
+
     deepbots_eval = subparsers.add_parser("deepbots-eval", help="Evaluate a policy for a finite number of deepbots episodes.")
     deepbots_eval.add_argument("--name", help="Run name for the eval summary.")
     deepbots_eval.add_argument("--policy", choices=("actor", "bootstrap", "expert", "sac"), default="actor")
@@ -1453,6 +1641,43 @@ def build_parser():
     deepbots_train.set_defaults(launch_webots=True)
     deepbots_train.set_defaults(func=cmd_deepbots_train)
 
+    deepbots_serl_train = subparsers.add_parser("deepbots-serl-train", help="Train SERL SAC online inside Webots with separate teleop demo and online replay buffers.")
+    deepbots_serl_train.add_argument("demo_traces", nargs="*", type=Path, help="Teleop JSONL traces, directories, or globs. Default: tmp/rl_traces/*teleop*.jsonl")
+    deepbots_serl_train.add_argument("--name", help="Run name for the SERL online training trace.")
+    deepbots_serl_train.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    deepbots_serl_train.add_argument("--output", type=Path, help="Runtime .npz output path. Defaults to e2e_rl_policy_weights.npz.")
+    deepbots_serl_train.add_argument("--python", help="Python interpreter for the Webots controller; must have SERL/JAX dependencies.")
+    deepbots_serl_train.add_argument("--serl-root", type=Path, default=Path(os.environ.get("SERL_ROOT", "~/serl")).expanduser())
+    deepbots_serl_train.add_argument("--timesteps", type=int, default=50000, help="Online Webots environment steps.")
+    deepbots_serl_train.add_argument("--pretrain-steps", type=int, default=500, help="SERL updates on the separate demo buffer before online rollout.")
+    deepbots_serl_train.add_argument("--learning-starts", type=int, help="First online step at which updates are allowed.")
+    deepbots_serl_train.add_argument("--random-steps", type=int, default=0, help="Initial random online exploration steps.")
+    deepbots_serl_train.add_argument("--batch-size", type=int, default=256)
+    deepbots_serl_train.add_argument("--utd-ratio", type=int, default=8)
+    deepbots_serl_train.add_argument("--updates-per-step", type=int, default=1)
+    deepbots_serl_train.add_argument("--update-every", type=int, default=1)
+    deepbots_serl_train.add_argument("--lr", type=float, default=3e-4)
+    deepbots_serl_train.add_argument("--gamma", type=float, default=0.995)
+    deepbots_serl_train.add_argument("--capacity", type=int, default=200000)
+    deepbots_serl_train.add_argument("--critic-ensemble-size", type=int, default=10)
+    deepbots_serl_train.add_argument("--critic-subsample-size", type=int, default=2)
+    deepbots_serl_train.add_argument("--success-only", action="store_true", help="Prefill replay only from successful teleop episodes.")
+    deepbots_serl_train.add_argument("--allow-empty-demos", action="store_true", help="Allow online SERL from scratch without teleop replay.")
+    deepbots_serl_train.add_argument("--log-period", type=int, default=100)
+    deepbots_serl_train.add_argument("--phase", type=int, default=3)
+    deepbots_serl_train.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_serl_train.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
+    deepbots_serl_train.add_argument("--seed", type=int, default=7)
+    deepbots_serl_train.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
+    deepbots_serl_train.add_argument("--webots-bin", help="Path to the Webots executable.")
+    deepbots_serl_train.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast", help="Webots run mode.")
+    deepbots_serl_train.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch/no-rendering mode.")
+    deepbots_serl_train.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during online SERL training.")
+    deepbots_serl_train.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
+    deepbots_serl_train.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
+    deepbots_serl_train.set_defaults(launch_webots=True)
+    deepbots_serl_train.set_defaults(func=cmd_deepbots_serl_train)
+
     for sub_name, help_text, func in (
         ("train", "Train an actor checkpoint from collected traces.", cmd_train),
         ("train-activate", "Train from traces and activate the resulting weights file.", cmd_train_activate),
@@ -1471,6 +1696,26 @@ def build_parser():
         sub.add_argument("--weighting", choices=("advantage", "uniform"), default="advantage")
         sub.add_argument("--device", default="cpu")
         sub.set_defaults(func=func)
+
+    serl_train = subparsers.add_parser("serl-train", help="Offline demo-only SERL SAC update/export. For online RL use deepbots-serl-train.")
+    serl_train.add_argument("traces", nargs="*", help="Teleop trace files, directories, or globs. Default: tmp/rl_traces/*teleop*.jsonl")
+    serl_train.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
+    serl_train.add_argument("--serl-root", type=Path, default=Path(os.environ.get("SERL_ROOT", "~/serl")).expanduser())
+    serl_train.add_argument("--python", default=os.environ.get("SERL_PYTHON"), help="Python interpreter with SERL/JAX dependencies. Defaults to the current interpreter.")
+    serl_train.add_argument("--output", type=Path, help="Runtime .npz output path. Defaults to e2e_rl_policy_weights.npz.")
+    serl_train.add_argument("--steps", type=int, default=8000)
+    serl_train.add_argument("--batch-size", type=int, default=256)
+    serl_train.add_argument("--utd-ratio", type=int, default=8)
+    serl_train.add_argument("--lr", type=float, default=3e-4)
+    serl_train.add_argument("--gamma", type=float, default=0.995)
+    serl_train.add_argument("--seed", type=int, default=7)
+    serl_train.add_argument("--capacity", type=int, default=200000)
+    serl_train.add_argument("--critic-ensemble-size", type=int, default=10)
+    serl_train.add_argument("--critic-subsample-size", type=int, default=2)
+    serl_train.add_argument("--success-only", action="store_true")
+    serl_train.add_argument("--log-period", type=int, default=100)
+    serl_train.add_argument("--dry-run", action="store_true")
+    serl_train.set_defaults(func=cmd_serl_train)
 
     activate = subparsers.add_parser("activate", help="Convert a checkpoint into the runtime .npz weights file.")
     activate.add_argument("checkpoint", help="PyTorch checkpoint created by train_rl_actor_from_traces.py")

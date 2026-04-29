@@ -28,6 +28,45 @@ RL_FORWARD_SCALE = 5.6
 RL_TURN_SCALE = 3.2
 VISUALIZER_DEFAULT_ENABLED = True
 OBSERVATION_FOV = math.pi / 2.0
+E2E_FEATURE_NAMES = (
+    "ball_visible",
+    "ball_known",
+    "ball_dist_norm",
+    "sin_ball_angle",
+    "cos_ball_angle",
+    "ball_age_norm",
+    "ball_confidence",
+    "robot_x_norm",
+    "robot_y_norm",
+    "sin_robot_heading",
+    "cos_robot_heading",
+    "goal_dist_norm",
+    "sin_goal_angle",
+    "cos_goal_angle",
+    "ball_x_norm",
+    "ball_y_norm",
+    "ball_to_goal_dist_norm",
+    "sin_ball_to_goal_angle",
+    "cos_ball_to_goal_angle",
+    "behind_ball_score_norm",
+    "signed_lateral_error_norm",
+    "robot_ball_dist_norm",
+    "ball_goal_alignment",
+    "localizer_confidence",
+    "pose_correction_trust",
+    "landmark_count_norm",
+    "structure_count_norm",
+    "no_landmark_age_norm",
+    "wall_margin_norm",
+    "opponent_visible",
+    "opponent_dist_norm",
+    "sin_opponent_angle",
+    "cos_opponent_angle",
+    "opponent_ball_dist_norm",
+    "opponent_goal_lane_block",
+)
+E2E_INPUT_DIM = len(E2E_FEATURE_NAMES)
+E2E_REVERSE_SCALE = 2.0
 
 
 def clamp(value, low, high):
@@ -1162,6 +1201,87 @@ class EmbeddedActorPolicy:
         return np.tanh(self.w3 @ h2 + self.b3)
 
 
+class EndToEndActorPolicy:
+    INPUT_DIM = E2E_INPUT_DIM
+    HIDDEN_DIM = 64
+    RUNTIME_WEIGHTS_FILENAME = "e2e_rl_policy_weights.npz"
+    FEATURE_NAMES = E2E_FEATURE_NAMES
+
+    def __init__(self):
+        self.source = "untrained_zero"
+        runtime_weights = self._load_runtime_actor()
+        if runtime_weights is not None:
+            self.w1, self.b1, self.w2, self.b2, self.w3, self.b3 = runtime_weights
+        else:
+            self.w1, self.b1, self.w2, self.b2, self.w3, self.b3 = self._build_zero_actor()
+
+    def _runtime_weights_path(self):
+        env_path = os.environ.get("E2E_POLICY_WEIGHTS_PATH") or os.environ.get("RL_POLICY_WEIGHTS_PATH")
+        if env_path:
+            candidate = Path(env_path).expanduser()
+            if candidate.exists():
+                return candidate
+            print(f"E2E policy weights path not found, falling back to zero actor: {candidate}")
+            return None
+
+        candidate = Path(__file__).with_name(self.RUNTIME_WEIGHTS_FILENAME)
+        if candidate.exists():
+            return candidate
+        return None
+
+    def _load_runtime_actor(self):
+        candidate = self._runtime_weights_path()
+        if candidate is None:
+            return None
+
+        expected_shapes = {
+            "w1": (self.HIDDEN_DIM, self.INPUT_DIM),
+            "b1": (self.HIDDEN_DIM,),
+            "w2": (self.HIDDEN_DIM, self.HIDDEN_DIM),
+            "b2": (self.HIDDEN_DIM,),
+            "w3": (2, self.HIDDEN_DIM),
+            "b3": (2,),
+        }
+
+        try:
+            with np.load(candidate) as data:
+                arrays = []
+                for key, shape in expected_shapes.items():
+                    if key not in data:
+                        raise KeyError(f"missing key {key}")
+                    array = np.asarray(data[key], dtype=np.float32)
+                    if array.shape != shape:
+                        raise ValueError(f"{key} has shape {array.shape}, expected {shape}")
+                    arrays.append(array)
+        except Exception as exc:
+            print(f"Failed to load E2E policy weights from {candidate}: {exc}")
+            return None
+
+        self.source = str(candidate)
+        print(f"Loaded E2E policy weights from {candidate}")
+        return tuple(arrays)
+
+    def _build_zero_actor(self):
+        w1 = np.zeros((self.HIDDEN_DIM, self.INPUT_DIM), dtype=np.float32)
+        b1 = np.zeros(self.HIDDEN_DIM, dtype=np.float32)
+        w2 = np.zeros((self.HIDDEN_DIM, self.HIDDEN_DIM), dtype=np.float32)
+        b2 = np.zeros(self.HIDDEN_DIM, dtype=np.float32)
+        w3 = np.zeros((2, self.HIDDEN_DIM), dtype=np.float32)
+        b3 = np.zeros(2, dtype=np.float32)
+
+        for i in range(min(self.INPUT_DIM, self.HIDDEN_DIM // 2)):
+            w1[i, i] = 1.0
+            w1[self.HIDDEN_DIM // 2 + i, i] = -1.0
+            w2[i, i] = 1.0
+            w2[self.HIDDEN_DIM // 2 + i, self.HIDDEN_DIM // 2 + i] = 1.0
+        return w1, b1, w2, b2, w3, b3
+
+    def __call__(self, features):
+        h1 = np.tanh(self.w1 @ features + self.b1)
+        h2 = np.tanh(self.w2 @ h1 + self.b2)
+        return np.tanh(self.w3 @ h2 + self.b3)
+
+
 class StudentController:
     def __init__(self):
         self.localizer = MultiHypothesisLocalizer()
@@ -1169,8 +1289,10 @@ class StudentController:
         self.visualizer = LiveVisualizerClient()
         self.transition_logger = TransitionLogger()
         self.actor = EmbeddedActorPolicy()
+        self.e2e_actor = EndToEndActorPolicy()
+        self.e2e_enabled = os.environ.get("RL_POLICY_MODE", "").lower() == "e2e"
 
-        self.state = "SEARCH_BALL"
+        self.state = "E2E_RL" if self.e2e_enabled else "SEARCH_BALL"
         self.state_age = 0
         self.step_count = 0
         self.search_direction = 1.0
@@ -2177,6 +2299,142 @@ class StudentController:
         }
         return features, context
 
+    def extract_e2e_features(self, pose, sensors):
+        ball_visible = 1.0 if sensors.get("ball") is not None else 0.0
+        ball_rel, ball_position = self._ball_observation(pose, sensors)
+        if ball_rel is None:
+            ball_rel = self.last_seen_ball_rel if self.last_seen_ball_rel is not None else (2.0, 0.0)
+        if ball_position is None and self.ball_tracker.position is not None:
+            ball_position = self.ball_tracker.position
+
+        ball_known = 1.0 if ball_position is not None and self._has_reliable_ball_estimate(max_age=180) else 0.0
+        goal_rel = relative_polar(pose, self.attack_goal)
+        wall_margin_norm = clamp(self._wall_margin(pose) / 1.5, 0.0, 1.0)
+        stats = self.last_measurement_stats or self._observation_stats(sensors)
+
+        ball_x_norm = 0.0
+        ball_y_norm = 0.0
+        ball_to_goal_dist_norm = 1.0
+        ball_to_goal_angle = goal_rel[1]
+        behind_score_norm = 0.0
+        signed_lateral_error_norm = 0.0
+        robot_ball_dist_norm = clamp(ball_rel[0] / 2.0, 0.0, 1.0)
+        ball_goal_alignment = -1.0
+        goal_unit_x = 1.0
+        goal_unit_y = 0.0
+        ball_to_goal_dist = 9.0
+
+        if ball_position is not None:
+            ball_x_norm = clamp(ball_position[0] / FIELD_X_HALF, -1.0, 1.0)
+            ball_y_norm = clamp(ball_position[1] / FIELD_Y_HALF, -1.0, 1.0)
+            goal_dx = self.attack_goal[0] - ball_position[0]
+            goal_dy = self.attack_goal[1] - ball_position[1]
+            ball_to_goal_dist = max(1e-6, math.hypot(goal_dx, goal_dy))
+            goal_unit_x = goal_dx / ball_to_goal_dist
+            goal_unit_y = goal_dy / ball_to_goal_dist
+            ball_to_goal_heading = math.atan2(goal_unit_y, goal_unit_x)
+            ball_to_goal_angle = wrap_to_pi(ball_to_goal_heading - pose[2])
+            ball_to_goal_dist_norm = clamp(ball_to_goal_dist / 9.0, 0.0, 1.0)
+            robot_from_ball_x = pose[0] - ball_position[0]
+            robot_from_ball_y = pose[1] - ball_position[1]
+            behind_score = robot_from_ball_x * (-goal_unit_x) + robot_from_ball_y * (-goal_unit_y)
+            signed_lateral_error = robot_from_ball_x * (-goal_unit_y) + robot_from_ball_y * goal_unit_x
+            behind_score_norm = clamp(behind_score / 1.2, -1.0, 1.0)
+            signed_lateral_error_norm = clamp(signed_lateral_error / 1.2, -1.0, 1.0)
+            robot_ball_dist_norm = clamp(distance(pose[:2], ball_position) / 2.0, 0.0, 1.0)
+            ball_goal_alignment = math.cos(wrap_to_pi(goal_rel[1] - ball_rel[1]))
+
+        opponent_obs = sensors.get("opponent")
+        opponent_visible = 1.0 if opponent_obs is not None else 0.0
+        opponent_dist_norm = 1.0
+        opponent_angle = 0.0
+        opponent_ball_dist_norm = 1.0
+        opponent_goal_lane_block = 0.0
+        if opponent_obs is not None:
+            opponent_dist_norm = clamp(float(opponent_obs[0]) / 3.0, 0.0, 1.0)
+            opponent_angle = float(opponent_obs[1])
+            if ball_position is not None:
+                opponent_position = polar_to_world(pose, opponent_obs)
+                opponent_ball_dist_norm = clamp(distance(opponent_position, ball_position) / 3.0, 0.0, 1.0)
+                opponent_from_ball_x = opponent_position[0] - ball_position[0]
+                opponent_from_ball_y = opponent_position[1] - ball_position[1]
+                lane_along = opponent_from_ball_x * goal_unit_x + opponent_from_ball_y * goal_unit_y
+                lane_lateral = abs(opponent_from_ball_x * (-goal_unit_y) + opponent_from_ball_y * goal_unit_x)
+                if 0.0 < lane_along < ball_to_goal_dist:
+                    opponent_goal_lane_block = clamp(1.0 - lane_lateral / 0.85, 0.0, 1.0)
+
+        features = np.array(
+            [
+                ball_visible,
+                ball_known,
+                clamp(ball_rel[0] / 2.0, 0.0, 1.0),
+                math.sin(ball_rel[1]),
+                math.cos(ball_rel[1]),
+                clamp(self.ball_tracker.age / 60.0, 0.0, 1.0),
+                clamp(self.ball_tracker.confidence, 0.0, 1.0),
+                clamp(pose[0] / FIELD_X_HALF, -1.0, 1.0),
+                clamp(pose[1] / FIELD_Y_HALF, -1.0, 1.0),
+                math.sin(pose[2]),
+                math.cos(pose[2]),
+                clamp(goal_rel[0] / 9.0, 0.0, 1.0),
+                math.sin(goal_rel[1]),
+                math.cos(goal_rel[1]),
+                ball_x_norm,
+                ball_y_norm,
+                ball_to_goal_dist_norm,
+                math.sin(ball_to_goal_angle),
+                math.cos(ball_to_goal_angle),
+                behind_score_norm,
+                signed_lateral_error_norm,
+                robot_ball_dist_norm,
+                ball_goal_alignment,
+                clamp(self.localizer.confidence, 0.0, 1.0),
+                clamp(self.pose_correction_trust, 0.0, 1.0),
+                clamp(float(stats.get("total_count", 0)) / 4.0, 0.0, 1.0),
+                clamp(float(stats.get("structure_count", 0)) / 3.0, 0.0, 1.0),
+                clamp(self.no_landmark_steps / 300.0, 0.0, 1.0),
+                wall_margin_norm,
+                opponent_visible,
+                opponent_dist_norm,
+                math.sin(opponent_angle),
+                math.cos(opponent_angle),
+                opponent_ball_dist_norm,
+                opponent_goal_lane_block,
+            ],
+            dtype=np.float32,
+        )
+
+        context = {
+            "ball_visible": sensors.get("ball") is not None,
+            "ball_known": bool(ball_known),
+            "ball_rel": ball_rel,
+            "ball_position": ball_position,
+            "goal_rel": goal_rel,
+            "opponent_visible": opponent_obs is not None,
+            "pose": pose,
+        }
+        return features, context
+
+    def observe_e2e_features(self, sensors, advance_step=False):
+        if advance_step:
+            self.step_count += 1
+            self.state_age += 1
+
+        odometry = sensors.get("odometry")
+        self._integrate_odometry_pose(odometry)
+        self.localizer.predict(odometry)
+        localizer_pose = self.localizer.update(sensors)
+        pose = self._fuse_pose_estimate(localizer_pose, sensors)
+        self._update_localization_visibility_counters()
+
+        ball_pose_trust = clamp(0.08 + 0.92 * self.pose_correction_trust, 0.0, 1.0)
+        self.ball_tracker.update(pose, sensors.get("ball"), pose_trust=ball_pose_trust)
+
+        features, context = self.extract_e2e_features(pose, sensors)
+        self.last_rl_features = features
+        self.last_rl_context = context
+        return features, context, pose
+
     def _geometric_rl_prior(self, context):
         pose = context.get("pose", self.localizer.pose)
         ball_visible = bool(context.get("ball_visible", False))
@@ -2875,6 +3133,16 @@ class StudentController:
             forward = 0.0
         return self._wheel_command(forward, turn)
 
+    def e2e_policy(self, features):
+        return np.clip(self.e2e_actor(features), -1.0, 1.0)
+
+    def _e2e_action_to_control(self, action):
+        a_linear = clamp(float(action[0]), -1.0, 1.0)
+        a_turn = clamp(float(action[1]), -1.0, 1.0)
+        forward = RL_FORWARD_SCALE * a_linear if a_linear >= 0.0 else E2E_REVERSE_SCALE * a_linear
+        turn = RL_TURN_SCALE * a_turn
+        return self._wheel_command(forward, turn)
+
     def _action_to_control(self, action):
         a_forward = clamp(float(action[0]), -1.0, 1.0)
         a_turn = clamp(float(action[1]), -1.0, 1.0)
@@ -3020,6 +3288,16 @@ class StudentController:
         Output:
         control_dict: dict, contains control for "left_motor" and "right_motor"
         """
+        if self.e2e_enabled:
+            features, context, pose = self.observe_e2e_features(sensors, advance_step=True)
+            del context
+            action = self.e2e_policy(features)
+            self.last_rl_action = np.asarray(action, dtype=np.float32)
+            control = self._e2e_action_to_control(action)
+            self._log_transition(sensors, pose, control)
+            self._publish_visualizer(sensors, pose)
+            return control
+
         self.step_count += 1
         self.state_age += 1
 

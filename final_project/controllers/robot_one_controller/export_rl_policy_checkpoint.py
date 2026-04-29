@@ -1,4 +1,4 @@
-"""Export a trained 16->64->64->2 tanh actor to starter_controller.py arrays."""
+"""Export a trained E2E belief-feature 64->64->2 tanh actor to starter_controller.py arrays."""
 
 import argparse
 import json
@@ -6,9 +6,11 @@ from pathlib import Path
 
 import torch
 
+from starter_controller import E2E_INPUT_DIM
+
 
 EXPECTED_SHAPES = {
-    "w1": (64, 16),
+    "w1": (64, E2E_INPUT_DIM),
     "b1": (64,),
     "w2": (64, 64),
     "b2": (64,),
