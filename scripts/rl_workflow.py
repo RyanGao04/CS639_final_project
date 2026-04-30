@@ -38,6 +38,16 @@ DEFAULT_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo.wbt"
 DEEPBOTS_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo_deepbots.wbt"
 DEEPBOTS_CONTROLLER = ROOT / "final_project" / "controllers" / "rl_training_controller" / "rl_training_controller.py"
 DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS = 6000
+RESET_SAMPLER_CHOICES = ("central", "full_field")
+RESET_ENV_EXPORT_KEYS = (
+    "RL_DEEPBOTS_RESET_SAMPLER",
+    "RL_DEEPBOTS_RESET_BALL_MARGIN",
+    "RL_DEEPBOTS_RESET_EDGE_BAND",
+    "RL_DEEPBOTS_RESET_EDGE_FRACTION",
+    "RL_DEEPBOTS_RESET_CORNER_FRACTION",
+    "RL_DEEPBOTS_RESET_BEHIND_FRACTION",
+    "RL_DEEPBOTS_RESET_MIN_ROBOT_DIST",
+)
 
 
 EXPECTED_SHAPES = {
@@ -57,6 +67,20 @@ def _timestamp():
 def _ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _add_reset_sampler_args(parser):
+    parser.add_argument(
+        "--reset-sampler",
+        choices=RESET_SAMPLER_CHOICES,
+        help="Deepbots phase-3 ball reset sampler. full_field covers interior, edges, corners, and behind-robot starts.",
+    )
+    parser.add_argument("--reset-ball-margin", type=float, help="Minimum ball distance from the field boundary for reset sampling.")
+    parser.add_argument("--reset-edge-band", type=float, help="Width of the near-edge band used by edge/corner oversampling.")
+    parser.add_argument("--reset-edge-fraction", type=float, help="Fraction of full-field resets sampled from non-corner field edges.")
+    parser.add_argument("--reset-corner-fraction", type=float, help="Fraction of full-field resets sampled from field corners.")
+    parser.add_argument("--reset-behind-fraction", type=float, help="Fraction of full-field resets sampled behind the fixed robot start.")
+    parser.add_argument("--reset-min-robot-dist", type=float, help="Reject phase-3 ball starts closer than this to the fixed robot start.")
 
 
 def _normalize_name(name):
@@ -567,6 +591,19 @@ def _base_deepbots_env(args, trace_path=None):
         env["RL_DEEPBOTS_WARM_START_WEIGHTS"] = str(Path(args.warm_start_weights).expanduser().resolve())
     if getattr(args, "sac_log_std_init", None) is not None:
         env["RL_DEEPBOTS_SAC_LOG_STD_INIT"] = str(args.sac_log_std_init)
+    reset_env_keys = (
+        ("reset_sampler", "RL_DEEPBOTS_RESET_SAMPLER"),
+        ("reset_ball_margin", "RL_DEEPBOTS_RESET_BALL_MARGIN"),
+        ("reset_edge_band", "RL_DEEPBOTS_RESET_EDGE_BAND"),
+        ("reset_edge_fraction", "RL_DEEPBOTS_RESET_EDGE_FRACTION"),
+        ("reset_corner_fraction", "RL_DEEPBOTS_RESET_CORNER_FRACTION"),
+        ("reset_behind_fraction", "RL_DEEPBOTS_RESET_BEHIND_FRACTION"),
+        ("reset_min_robot_dist", "RL_DEEPBOTS_RESET_MIN_ROBOT_DIST"),
+    )
+    for attr, env_name in reset_env_keys:
+        value = getattr(args, attr, None)
+        if value is not None:
+            env[env_name] = str(value)
     if getattr(args, "demo_traces", None):
         demo_paths = [str(Path(path).expanduser().resolve()) for path in args.demo_traces]
         env["RL_DEEPBOTS_DEMO_TRACES"] = os.pathsep.join(demo_paths)
@@ -586,7 +623,7 @@ def cmd_deepbots_record(args):
         raise SystemExit("--policy sac requires --model pointing to an SB3 SAC .zip file.")
 
     run_name = _normalize_name(args.name or _timestamp())
-    trace_path = _deepbots_trace_path(args, run_name=run_name)
+    trace_path = None if args.no_trace else _deepbots_trace_path(args, run_name=run_name)
     env = _base_deepbots_env(args, trace_path=trace_path)
     if args.policy == "sac":
         mode = "sac_eval"
@@ -600,7 +637,10 @@ def cmd_deepbots_record(args):
         env["RL_DEEPBOTS_MODEL_PATH"] = str(Path(args.model).expanduser().resolve())
 
     print(f"Deepbots mode: {mode}")
-    print(f"Trace file: {trace_path}")
+    if trace_path is None:
+        print("Trace file: disabled")
+    else:
+        print(f"Trace file: {trace_path}")
     if "RL_POLICY_WEIGHTS_PATH" in env:
         print(f"RL_POLICY_WEIGHTS_PATH={env['RL_POLICY_WEIGHTS_PATH']}")
     if "RL_DEEPBOTS_MODEL_PATH" in env:
@@ -621,7 +661,7 @@ def cmd_deepbots_record(args):
             "E2E_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
-        ),
+        ) + RESET_ENV_EXPORT_KEYS,
     )
     return 0
 
@@ -648,7 +688,7 @@ def cmd_deepbots_teleop(args):
             "RL_DEEPBOTS_PHASE",
             "RL_DEEPBOTS_MAX_STEPS",
             "RL_DEEPBOTS_SEED",
-        ),
+        ) + RESET_ENV_EXPORT_KEYS,
     )
     return 0
 
@@ -710,7 +750,7 @@ def cmd_deepbots_eval(args):
             "E2E_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
-        ),
+        ) + RESET_ENV_EXPORT_KEYS,
     )
     return 0
 
@@ -787,7 +827,7 @@ def cmd_deepbots_train(args):
             "RL_DEEPBOTS_LR",
             "RL_DEEPBOTS_GAMMA",
             "RL_DEEPBOTS_TENSORBOARD_DIR",
-        ),
+        ) + RESET_ENV_EXPORT_KEYS,
     )
     return 0
 
@@ -865,7 +905,7 @@ def cmd_deepbots_serl_train(args):
             "RL_DEEPBOTS_UPDATES_PER_STEP",
             "RL_DEEPBOTS_LOG_PERIOD",
             "RL_DEEPBOTS_TERMINATE_OUT_OF_PLAY",
-        ),
+        ) + RESET_ENV_EXPORT_KEYS,
     )
     return 0
 
@@ -1543,18 +1583,20 @@ def build_parser():
     deepbots_record = subparsers.add_parser("deepbots-record", help="Run the deepbots world with live policy actions and transition logging.")
     deepbots_record.add_argument("name", nargs="?", help="Trace run name.")
     deepbots_record.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
-    deepbots_record.add_argument("--policy", choices=("actor", "bootstrap", "expert", "random", "sac"), default="actor", help="Policy source for live actions.")
+    deepbots_record.add_argument("--policy", choices=("actor", "async_actor", "bootstrap", "expert", "random", "sac"), default="actor", help="Policy source for live actions.")
     deepbots_record.add_argument("--weights", type=Path, help="Runtime .npz actor weights for --policy actor.")
     deepbots_record.add_argument("--model", type=Path, help="SB3 SAC .zip model for --policy sac.")
     deepbots_record.add_argument("--phase", type=int, default=2, help="Curriculum phase used by the deepbots reset sampler.")
     deepbots_record.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
     deepbots_record.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
+    deepbots_record.add_argument("--no-trace", action="store_true", help="Do not write per-step JSONL transitions.")
     deepbots_record.add_argument("--seed", type=int, default=7)
     deepbots_record.add_argument("--python", help="Python interpreter for the Webots controller.")
     deepbots_record.add_argument("--world", default=str(DEEPBOTS_WORLD), help="Deepbots Webots world to launch.")
     deepbots_record.add_argument("--webots-bin", help="Path to the Webots executable.")
     deepbots_record.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="realtime", help="Webots run mode.")
     deepbots_record.add_argument("--batch", action="store_true", help="Launch Webots in batch mode.")
+    _add_reset_sampler_args(deepbots_record)
     deepbots_record.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
     deepbots_record.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_record.set_defaults(launch_webots=True)
@@ -1572,6 +1614,7 @@ def build_parser():
     deepbots_teleop.add_argument("--webots-bin", help="Path to the Webots executable.")
     deepbots_teleop.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="realtime", help="Webots run mode.")
     deepbots_teleop.add_argument("--batch", action="store_true", default=False, help="Launch Webots in batch mode.")
+    _add_reset_sampler_args(deepbots_teleop)
     deepbots_teleop.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
     deepbots_teleop.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_teleop.set_defaults(launch_webots=True)
@@ -1597,6 +1640,7 @@ def build_parser():
     deepbots_eval.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast")
     deepbots_eval.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch mode.")
     deepbots_eval.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during evaluation.")
+    _add_reset_sampler_args(deepbots_eval)
     deepbots_eval.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
     deepbots_eval.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_eval.set_defaults(launch_webots=True)
@@ -1632,6 +1676,7 @@ def build_parser():
     deepbots_train.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast", help="Webots run mode.")
     deepbots_train.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch mode.")
     deepbots_train.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during training.")
+    _add_reset_sampler_args(deepbots_train)
     deepbots_train.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
     deepbots_train.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_train.set_defaults(launch_webots=True)
@@ -1669,6 +1714,7 @@ def build_parser():
     deepbots_serl_train.add_argument("--webots-mode", choices=("pause", "realtime", "fast"), default="fast", help="Webots run mode.")
     deepbots_serl_train.add_argument("--batch", action="store_true", default=True, help="Launch Webots in batch/no-rendering mode.")
     deepbots_serl_train.add_argument("--no-batch", dest="batch", action="store_false", help="Show the Webots GUI during online SERL training.")
+    _add_reset_sampler_args(deepbots_serl_train)
     deepbots_serl_train.add_argument("--no-launch-webots", dest="launch_webots", action="store_false", help="Only print environment exports.")
     deepbots_serl_train.add_argument("--dry-run", action="store_true", help="Print the launch command without running it.")
     deepbots_serl_train.set_defaults(launch_webots=True)

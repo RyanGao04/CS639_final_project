@@ -225,6 +225,29 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
         self.odometry_noise = max(0.0, _env_float("RL_DEEPBOTS_ODOMETRY_NOISE", 0.01))
         self.ball_dropout = clamp(_env_float("RL_DEEPBOTS_BALL_DROPOUT", 0.08 if self.phase >= 3 else 0.0), 0.0, 0.9)
         self.tournament_mirror = os.environ.get("RL_DEEPBOTS_TOURNAMENT_MIRROR", "1") != "0"
+        reset_sampler = os.environ.get("RL_DEEPBOTS_RESET_SAMPLER", "").strip().lower().replace("-", "_")
+        if not reset_sampler:
+            reset_sampler = "full_field" if self.phase >= 3 else "central"
+        if reset_sampler in ("legacy", "curriculum", "phase3"):
+            reset_sampler = "central"
+        if reset_sampler not in ("central", "full_field"):
+            print(f"Unknown RL_DEEPBOTS_RESET_SAMPLER={reset_sampler!r}; using full_field.")
+            reset_sampler = "full_field"
+        self.reset_sampler = reset_sampler
+        self.reset_ball_margin = clamp(
+            _env_float("RL_DEEPBOTS_RESET_BALL_MARGIN", 0.12),
+            0.02,
+            min(FIELD_X_HALF, FIELD_Y_HALF) - 0.05,
+        )
+        self.reset_edge_band = clamp(
+            _env_float("RL_DEEPBOTS_RESET_EDGE_BAND", 0.75),
+            0.05,
+            min(FIELD_X_HALF, FIELD_Y_HALF),
+        )
+        self.reset_edge_fraction = clamp(_env_float("RL_DEEPBOTS_RESET_EDGE_FRACTION", 0.30), 0.0, 1.0)
+        self.reset_corner_fraction = clamp(_env_float("RL_DEEPBOTS_RESET_CORNER_FRACTION", 0.20), 0.0, 1.0)
+        self.reset_behind_fraction = clamp(_env_float("RL_DEEPBOTS_RESET_BEHIND_FRACTION", 0.25), 0.0, 1.0)
+        self.reset_min_robot_dist = clamp(_env_float("RL_DEEPBOTS_RESET_MIN_ROBOT_DIST", 0.35), 0.0, 2.0)
         self.attack_sign = 1.0
         self.prev_position = None
         self.prev_rotation = None
@@ -433,21 +456,89 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
             or abs(ball[1]) > ARENA_Y_HALF - 0.04
         )
 
+    def _phase3_pose_and_ball(self, internal_ball):
+        if self.attack_sign > 0.0:
+            return (-1.0, 0.0, 0.0), internal_ball
+        return (1.0, 0.0, math.pi), (-internal_ball[0], -internal_ball[1])
+
+    def _is_valid_phase3_internal_ball(self, internal_ball):
+        return math.hypot(internal_ball[0] + 1.0, internal_ball[1]) >= self.reset_min_robot_dist
+
+    def _sample_phase3_central_ball(self):
+        return (
+            float(self.rng.uniform(-1.25, 1.50)),
+            float(self.rng.uniform(-1.50, 1.50)),
+        )
+
+    def _sample_near_field_edge(self, half_extent):
+        sign = -1.0 if self.rng.random() < 0.5 else 1.0
+        outer = max(self.reset_ball_margin, half_extent - self.reset_ball_margin)
+        inner = max(self.reset_ball_margin, half_extent - self.reset_edge_band)
+        if inner >= outer:
+            value = outer
+        else:
+            value = float(self.rng.uniform(inner, outer))
+        return sign * value
+
+    def _sample_phase3_full_field_ball(self):
+        min_x = -FIELD_X_HALF + self.reset_ball_margin
+        max_x = FIELD_X_HALF - self.reset_ball_margin
+        min_y = -FIELD_Y_HALF + self.reset_ball_margin
+        max_y = FIELD_Y_HALF - self.reset_ball_margin
+
+        corner_fraction = self.reset_corner_fraction
+        edge_fraction = self.reset_edge_fraction
+        behind_fraction = self.reset_behind_fraction
+        special_total = corner_fraction + edge_fraction + behind_fraction
+        if special_total > 1.0:
+            corner_fraction /= special_total
+            edge_fraction /= special_total
+            behind_fraction /= special_total
+
+        draw = self.rng.random()
+        if draw < corner_fraction:
+            return (
+                self._sample_near_field_edge(FIELD_X_HALF),
+                self._sample_near_field_edge(FIELD_Y_HALF),
+            )
+        draw -= corner_fraction
+
+        if draw < edge_fraction:
+            if self.rng.random() < 0.5:
+                return (
+                    self._sample_near_field_edge(FIELD_X_HALF),
+                    float(self.rng.uniform(min_y, max_y)),
+                )
+            return (
+                float(self.rng.uniform(min_x, max_x)),
+                self._sample_near_field_edge(FIELD_Y_HALF),
+            )
+        draw -= edge_fraction
+
+        if draw < behind_fraction:
+            behind_max_x = min(-1.02, max_x)
+            if behind_max_x > min_x:
+                return (
+                    float(self.rng.uniform(min_x, behind_max_x)),
+                    float(self.rng.uniform(min_y, max_y)),
+                )
+
+        return (
+            float(self.rng.uniform(min_x, max_x)),
+            float(self.rng.uniform(min_y, max_y)),
+        )
+
     def _sample_initial_state(self):
         self.attack_sign = 1.0
         if self.phase >= 3:
             self.attack_sign = -1.0 if self.tournament_mirror and self.rng.random() < 0.5 else 1.0
-            for _ in range(200):
-                internal_ball_x = float(self.rng.uniform(-1.25, 1.50))
-                internal_ball_y = float(self.rng.uniform(-1.50, 1.50))
-                if math.hypot(internal_ball_x + 1.0, internal_ball_y) < 0.35:
+            sampler = self._sample_phase3_full_field_ball if self.reset_sampler == "full_field" else self._sample_phase3_central_ball
+            for _ in range(400):
+                internal_ball = sampler()
+                if not self._is_valid_phase3_internal_ball(internal_ball):
                     continue
-                if self.attack_sign > 0.0:
-                    return (-1.0, 0.0, 0.0), (internal_ball_x, internal_ball_y)
-                return (1.0, 0.0, math.pi), (-internal_ball_x, -internal_ball_y)
-            if self.attack_sign > 0.0:
-                return (-1.0, 0.0, 0.0), (0.0, 0.0)
-            return (1.0, 0.0, math.pi), (0.0, 0.0)
+                return self._phase3_pose_and_ball(internal_ball)
+            return self._phase3_pose_and_ball((0.0, 0.0))
 
         for _ in range(200):
             ball_x = float(self.rng.uniform(-1.3, 1.5))
@@ -795,6 +886,127 @@ def run_actor_loop(env):
         obs, _, done, _ = env.step(action)
         if done:
             obs = env.reset()
+
+
+def _policy_weight_mtime(path):
+    if path is None:
+        return None
+    try:
+        return Path(path).expanduser().stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _async_policy_path():
+    raw_path = (
+        os.environ.get("RL_ASYNC_POLICY_WEIGHTS_PATH")
+        or os.environ.get("E2E_POLICY_WEIGHTS_PATH")
+        or os.environ.get("RL_POLICY_WEIGHTS_PATH")
+    )
+    if raw_path:
+        return Path(raw_path).expanduser()
+    if RUNTIME_WEIGHTS_PATH.exists():
+        return RUNTIME_WEIGHTS_PATH
+    return None
+
+
+def run_async_actor_worker(env):
+    try:
+        import zmq
+    except ImportError as exc:
+        raise RuntimeError("RL_DEEPBOTS_MODE=async_actor requires pyzmq.") from exc
+
+    endpoint = os.environ.get("RL_ASYNC_TRANSITION_PUSH", "tcp://127.0.0.1:5557")
+    worker_id = os.environ.get("RL_ASYNC_WORKER_ID", str(os.getpid()))
+    reload_every = max(1, _env_int("RL_ASYNC_RELOAD_EVERY", 250))
+    log_period = max(1, _env_int("RL_ASYNC_LOG_PERIOD", 1000))
+    max_steps = max(0, _env_int("RL_ASYNC_MAX_STEPS", 0))
+    send_hwm = max(100, _env_int("RL_ASYNC_SEND_HWM", 10000))
+
+    context = zmq.Context.instance()
+    socket = context.socket(zmq.PUSH)
+    socket.setsockopt(zmq.SNDHWM, send_hwm)
+    socket.connect(endpoint)
+
+    policy_path = _async_policy_path()
+    if policy_path is not None:
+        os.environ["E2E_POLICY_WEIGHTS_PATH"] = str(policy_path)
+    actor = EndToEndActorPolicy()
+    actor_mtime = _policy_weight_mtime(policy_path)
+
+    obs = env.reset()
+    step_count = 0
+    episode_count = 0
+    episode_return = 0.0
+    dropped = 0
+    print(
+        "async actor worker: "
+        f"id={worker_id} endpoint={endpoint} policy={policy_path} "
+        f"reload_every={reload_every} max_steps={max_steps or 'unbounded'}"
+    )
+
+    while True:
+        if policy_path is not None and step_count % reload_every == 0:
+            current_mtime = _policy_weight_mtime(policy_path)
+            if current_mtime is not None and current_mtime != actor_mtime:
+                actor = EndToEndActorPolicy()
+                actor_mtime = current_mtime
+                print(f"async actor worker={worker_id} reloaded policy {policy_path}")
+
+        action = np.asarray(actor(obs), dtype=np.float32)
+        action = np.clip(action, -1.0, 1.0)
+        next_obs, reward, done, info = env.step(action)
+        step_count += 1
+        episode_return += float(reward)
+
+        payload = {
+            "worker_id": worker_id,
+            "step": step_count,
+            "episode_index": episode_count,
+            "observations": [float(value) for value in obs],
+            "actions": [float(value) for value in action],
+            "next_observations": [float(value) for value in next_obs],
+            "rewards": float(reward),
+            "masks": 0.0 if done else 1.0,
+            "dones": bool(done),
+            "info": info,
+        }
+        try:
+            socket.send_json(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            dropped += 1
+
+        if done:
+            episode_count += 1
+            if info.get("correct_goal"):
+                outcome = "correct_goal"
+            elif info.get("wrong_goal"):
+                outcome = "wrong_goal"
+            elif int(info.get("episode_step", 0)) >= env.max_episode_steps:
+                outcome = "timeout"
+            else:
+                outcome = "out_of_play"
+            print(
+                f"async actor worker={worker_id} episode={episode_count} "
+                f"outcome={outcome} steps={info.get('episode_step')} "
+                f"return={episode_return:.3f} dropped={dropped}"
+            )
+            obs = env.reset()
+            episode_return = 0.0
+        else:
+            obs = next_obs
+
+        if step_count == 1 or step_count % log_period == 0:
+            print(
+                f"async actor worker={worker_id} step={step_count} "
+                f"episodes={episode_count} dropped={dropped}"
+            )
+
+        if max_steps and step_count >= max_steps:
+            print(f"async actor worker={worker_id} reached max_steps={max_steps}")
+            env.close()
+            env.simulationQuit(0)
+            return
 
 
 def run_random_loop(env):
@@ -1296,6 +1508,8 @@ def main():
     try:
         if mode == "actor":
             run_actor_loop(env)
+        elif mode == "async_actor":
+            run_async_actor_worker(env)
         elif mode == "random":
             run_random_loop(env)
         elif mode == "teleop":

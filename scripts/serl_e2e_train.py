@@ -51,6 +51,7 @@ def _import_serl(serl_root):
     if not serl_launcher.exists():
         raise SystemExit(f"SERL launcher not found: {serl_launcher}")
     sys.path.insert(0, str(serl_launcher))
+    _ensure_cuda_root()
 
     try:
         import gym
@@ -70,6 +71,20 @@ def _import_serl(serl_root):
         jax.tree_map = jax.tree_util.tree_map
 
     return gym, nn, jax, jnp, unfreeze, SACAgent, ReplayBuffer
+
+
+def _ensure_cuda_root():
+    if os.environ.get("CUDA_ROOT"):
+        return
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        Path(sys.prefix) / "lib" / version / "site-packages" / "nvidia" / "cuda_nvcc",
+        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cuda_nvcc",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            os.environ["CUDA_ROOT"] = str(candidate)
+            return
 
 
 def _collect_trace_files(patterns):
