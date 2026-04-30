@@ -38,6 +38,7 @@ DEFAULT_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo.wbt"
 DEEPBOTS_WORLD = ROOT / "final_project" / "worlds" / "soccer_solo_deepbots.wbt"
 DEEPBOTS_CONTROLLER = ROOT / "final_project" / "controllers" / "rl_training_controller" / "rl_training_controller.py"
 DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS = 6000
+DEFAULT_DEMO_PATTERNS = ("*teleop*.jsonl", "*cleaned_heuristic*.jsonl")
 RESET_SAMPLER_CHOICES = ("central", "full_field")
 RESET_ENV_EXPORT_KEYS = (
     "RL_DEEPBOTS_RESET_SAMPLER",
@@ -47,6 +48,7 @@ RESET_ENV_EXPORT_KEYS = (
     "RL_DEEPBOTS_RESET_CORNER_FRACTION",
     "RL_DEEPBOTS_RESET_BEHIND_FRACTION",
     "RL_DEEPBOTS_RESET_MIN_ROBOT_DIST",
+    "RL_DEEPBOTS_TOURNAMENT_MIRROR",
 )
 
 
@@ -81,6 +83,8 @@ def _add_reset_sampler_args(parser):
     parser.add_argument("--reset-corner-fraction", type=float, help="Fraction of full-field resets sampled from field corners.")
     parser.add_argument("--reset-behind-fraction", type=float, help="Fraction of full-field resets sampled behind the fixed robot start.")
     parser.add_argument("--reset-min-robot-dist", type=float, help="Reject phase-3 ball starts closer than this to the fixed robot start.")
+    parser.add_argument("--tournament-mirror", dest="tournament_mirror", action="store_true", default=None, help="Randomly mirror phase-3 starts so the correct goal may be left or right.")
+    parser.add_argument("--no-tournament-mirror", dest="tournament_mirror", action="store_false", help="Keep phase-3 starts on the assignment right-goal orientation.")
 
 
 def _normalize_name(name):
@@ -89,6 +93,10 @@ def _normalize_name(name):
 
 def _shell_quote(value):
     return json.dumps(str(value))
+
+
+def _default_demo_trace_args(trace_dir):
+    return [str(trace_dir / pattern) for pattern in DEFAULT_DEMO_PATTERNS]
 
 
 def _find_webots_binary(explicit_path=None):
@@ -485,7 +493,7 @@ def cmd_train(args):
 
 
 def cmd_serl_train(args):
-    traces = args.traces or [str(args.trace_dir / "*teleop*.jsonl")]
+    traces = args.traces or _default_demo_trace_args(args.trace_dir)
     trace_files = _collect_trace_files(traces, args.trace_dir)
     if not trace_files and not args.dry_run:
         raise SystemExit("No trace files found.")
@@ -604,6 +612,9 @@ def _base_deepbots_env(args, trace_path=None):
         value = getattr(args, attr, None)
         if value is not None:
             env[env_name] = str(value)
+    tournament_mirror = getattr(args, "tournament_mirror", None)
+    if tournament_mirror is not None:
+        env["RL_DEEPBOTS_TOURNAMENT_MIRROR"] = "1" if tournament_mirror else "0"
     if getattr(args, "demo_traces", None):
         demo_paths = [str(Path(path).expanduser().resolve()) for path in args.demo_traces]
         env["RL_DEEPBOTS_DEMO_TRACES"] = os.pathsep.join(demo_paths)
@@ -623,16 +634,23 @@ def cmd_deepbots_record(args):
         raise SystemExit("--policy sac requires --model pointing to an SB3 SAC .zip file.")
 
     run_name = _normalize_name(args.name or _timestamp())
-    trace_path = None if args.no_trace else _deepbots_trace_path(args, run_name=run_name)
+    suffix = "cleaned_heuristic" if args.policy in ("cleaned_heuristic", "expert") else "deepbots"
+    trace_path = None if args.no_trace else _deepbots_trace_path(args, suffix=suffix, run_name=run_name)
     env = _base_deepbots_env(args, trace_path=trace_path)
     if args.policy == "sac":
         mode = "sac_eval"
     elif args.policy == "bootstrap":
         mode = "actor"
         env["RL_DEEPBOTS_ACTOR_SOURCE"] = "bootstrap"
+    elif args.policy == "expert":
+        mode = "cleaned_heuristic"
     else:
         mode = args.policy
     env["RL_DEEPBOTS_MODE"] = mode
+    if getattr(args, "episodes", None) is not None:
+        env["RL_DEEPBOTS_RECORD_EPISODES"] = str(args.episodes)
+    if getattr(args, "total_steps", None) is not None:
+        env["RL_DEEPBOTS_TOTAL_STEPS"] = str(args.total_steps)
     if args.model:
         env["RL_DEEPBOTS_MODEL_PATH"] = str(Path(args.model).expanduser().resolve())
 
@@ -658,6 +676,8 @@ def cmd_deepbots_record(args):
             "RL_DEEPBOTS_PHASE",
             "RL_DEEPBOTS_MAX_STEPS",
             "RL_DEEPBOTS_SEED",
+            "RL_DEEPBOTS_RECORD_EPISODES",
+            "RL_DEEPBOTS_TOTAL_STEPS",
             "E2E_POLICY_WEIGHTS_PATH",
             "RL_DEEPBOTS_ACTOR_SOURCE",
             "RL_DEEPBOTS_MODEL_PATH",
@@ -837,7 +857,7 @@ def cmd_deepbots_serl_train(args):
     trace_path = _deepbots_trace_path(args, suffix="serl_train", run_name=run_name)
     output_path = Path(args.output).expanduser().resolve() if args.output else RUNTIME_WEIGHTS_PATH
     if not args.demo_traces:
-        args.demo_traces = [args.trace_dir / "*teleop*.jsonl"]
+        args.demo_traces = [Path(pattern) for pattern in _default_demo_trace_args(args.trace_dir)]
 
     env = _base_deepbots_env(args, trace_path=trace_path)
     env["RL_DEEPBOTS_MODE"] = "serl_train"
@@ -869,7 +889,7 @@ def cmd_deepbots_serl_train(args):
     if "WEBOTS_CONTROLLER_PYTHON" in env:
         print(f"Webots controller Python: {env['WEBOTS_CONTROLLER_PYTHON']}")
     if "RL_DEEPBOTS_DEMO_TRACES" in env:
-        print(f"Teleop demo traces: {env['RL_DEEPBOTS_DEMO_TRACES']}")
+        print(f"Demo traces: {env['RL_DEEPBOTS_DEMO_TRACES']}")
     print(f"SERL root: {env['SERL_ROOT']}")
 
     if args.launch_webots:
@@ -1583,11 +1603,13 @@ def build_parser():
     deepbots_record = subparsers.add_parser("deepbots-record", help="Run the deepbots world with live policy actions and transition logging.")
     deepbots_record.add_argument("name", nargs="?", help="Trace run name.")
     deepbots_record.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
-    deepbots_record.add_argument("--policy", choices=("actor", "async_actor", "bootstrap", "expert", "random", "sac"), default="actor", help="Policy source for live actions.")
+    deepbots_record.add_argument("--policy", choices=("actor", "async_actor", "bootstrap", "cleaned_heuristic", "expert", "random", "sac"), default="actor", help="Policy source for live actions.")
     deepbots_record.add_argument("--weights", type=Path, help="Runtime .npz actor weights for --policy actor.")
     deepbots_record.add_argument("--model", type=Path, help="SB3 SAC .zip model for --policy sac.")
     deepbots_record.add_argument("--phase", type=int, default=2, help="Curriculum phase used by the deepbots reset sampler.")
     deepbots_record.add_argument("--max-episode-steps", type=int, default=DEEPBOTS_DEFAULT_MAX_EPISODE_STEPS)
+    deepbots_record.add_argument("--episodes", type=int, help="Stop after this many completed episodes for finite demo collection.")
+    deepbots_record.add_argument("--total-steps", type=int, help="Stop after this many environment steps for finite demo collection.")
     deepbots_record.add_argument("--terminate-out-of-play", action="store_true", help="End an episode when the ball reaches the arena buffer/wall.")
     deepbots_record.add_argument("--no-trace", action="store_true", help="Do not write per-step JSONL transitions.")
     deepbots_record.add_argument("--seed", type=int, default=7)
@@ -1682,8 +1704,8 @@ def build_parser():
     deepbots_train.set_defaults(launch_webots=True)
     deepbots_train.set_defaults(func=cmd_deepbots_train)
 
-    deepbots_serl_train = subparsers.add_parser("deepbots-serl-train", help="Train SERL SAC online inside Webots with separate teleop demo and online replay buffers.")
-    deepbots_serl_train.add_argument("demo_traces", nargs="*", type=Path, help="Teleop JSONL traces, directories, or globs. Default: tmp/rl_traces/*teleop*.jsonl")
+    deepbots_serl_train = subparsers.add_parser("deepbots-serl-train", help="Train SERL SAC online inside Webots with separate demo and online replay buffers.")
+    deepbots_serl_train.add_argument("demo_traces", nargs="*", type=Path, help="Demo JSONL traces, directories, or globs. Default: teleop and cleaned-heuristic traces in tmp/rl_traces.")
     deepbots_serl_train.add_argument("--name", help="Run name for the SERL online training trace.")
     deepbots_serl_train.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
     deepbots_serl_train.add_argument("--output", type=Path, help="Runtime .npz output path. Defaults to e2e_rl_policy_weights.npz.")
@@ -1740,7 +1762,7 @@ def build_parser():
         sub.set_defaults(func=func)
 
     serl_train = subparsers.add_parser("serl-train", help="Offline demo-only SERL SAC update/export. For online RL use deepbots-serl-train.")
-    serl_train.add_argument("traces", nargs="*", help="Teleop trace files, directories, or globs. Default: tmp/rl_traces/*teleop*.jsonl")
+    serl_train.add_argument("traces", nargs="*", help="Demo trace files, directories, or globs. Default: teleop and cleaned-heuristic traces in tmp/rl_traces.")
     serl_train.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
     serl_train.add_argument("--serl-root", type=Path, default=Path(os.environ.get("SERL_ROOT", "~/serl")).expanduser())
     serl_train.add_argument("--python", default=os.environ.get("SERL_PYTHON"), help="Python interpreter with SERL/JAX dependencies. Defaults to the current interpreter.")

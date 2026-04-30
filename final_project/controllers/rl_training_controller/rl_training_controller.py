@@ -157,6 +157,28 @@ def _normalize_xy(dx, dy):
     return dx / norm, dy / norm
 
 
+def _create_cleaned_heuristic_controller():
+    from cleaned_heuristic_controller import StudentController as CleanedHeuristicController
+
+    return CleanedHeuristicController()
+
+
+def _control_to_action(control):
+    left = clamp(float(control.get("left_motor", 0.0)), -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
+    right = clamp(float(control.get("right_motor", 0.0)), -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
+    forward = 0.5 * (left + right)
+    turn = 0.5 * (right - left)
+    if forward >= 0.0:
+        a_forward = forward / max(RL_FORWARD_SCALE, 1e-6)
+    else:
+        a_forward = forward / max(E2E_REVERSE_SCALE, 1e-6)
+    a_turn = turn / max(RL_TURN_SCALE, 1e-6)
+    return np.array(
+        [clamp(a_forward, -1.0, 1.0), clamp(a_turn, -1.0, 1.0)],
+        dtype=np.float32,
+    )
+
+
 class JsonlTransitionLogger:
     def __init__(self):
         self.handle = None
@@ -617,6 +639,9 @@ class SoccerSoloDeepbotsEnv(RobotSupervisorEnv):
 
     def get_observations(self):
         sensors = self._build_student_sensors()
+        return self.observe_student_sensors(sensors)
+
+    def observe_student_sensors(self, sensors):
         features, _, _ = self.belief_controller.observe_e2e_features(sensors)
         self.last_observation = features
         return features.copy()
@@ -1080,6 +1105,58 @@ def run_teleop_loop(env):
             env.reset()
 
 
+def run_cleaned_heuristic_demo_loop(env):
+    target_episodes = max(0, _env_int("RL_DEEPBOTS_RECORD_EPISODES", 0))
+    max_steps = max(0, _env_int("RL_DEEPBOTS_TOTAL_STEPS", 0))
+    controller = _create_cleaned_heuristic_controller()
+    env.reset()
+    step_count = 0
+    episode_count = 0
+    print(
+        "Cleaned heuristic demo collection: "
+        f"target_episodes={target_episodes or 'unbounded'} "
+        f"max_steps={max_steps or 'unbounded'}"
+    )
+
+    while True:
+        sensors = env._build_student_sensors()
+        env.observe_student_sensors(sensors)
+        control = controller.step(sensors)
+        action = _control_to_action(control)
+        _, reward, done, info = env.step(action)
+        del reward
+        step_count += 1
+
+        if done:
+            episode_count += 1
+            if info.get("correct_goal"):
+                outcome = "correct_goal"
+            elif info.get("wrong_goal"):
+                outcome = "wrong_goal"
+            elif int(info.get("episode_step", 0)) >= env.max_episode_steps:
+                outcome = "timeout"
+            else:
+                outcome = "out_of_play"
+            print(
+                f"cleaned heuristic episode={episode_count} outcome={outcome} "
+                f"steps={info.get('episode_step')} total_steps={step_count}"
+            )
+            controller.close()
+            if target_episodes and episode_count >= target_episodes:
+                env.close()
+                env.simulationQuit(0)
+                return
+            controller = _create_cleaned_heuristic_controller()
+            env.reset()
+
+        if max_steps and step_count >= max_steps:
+            print(f"cleaned heuristic reached max_steps={max_steps}")
+            controller.close()
+            env.close()
+            env.simulationQuit(0)
+            return
+
+
 def run_sac_eval(env):
     try:
         from stable_baselines3 import SAC
@@ -1514,6 +1591,8 @@ def main():
             run_random_loop(env)
         elif mode == "teleop":
             run_teleop_loop(env)
+        elif mode in ("cleaned_heuristic", "expert"):
+            run_cleaned_heuristic_demo_loop(env)
         elif mode == "eval":
             run_eval_loop(env)
         elif mode == "sac_train":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train/export the E2E policy from teleop demos with SERL."""
+"""Train/export the E2E policy from teleop or heuristic demos with SERL."""
 
 import argparse
 from datetime import datetime
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "scripts" / "rl_workflow.py"
 TRACE_DIR = ROOT / "tmp" / "rl_traces"
 RUNTIME_WEIGHTS = ROOT / "final_project" / "controllers" / "robot_one_controller" / "e2e_rl_policy_weights.npz"
+DEFAULT_DEMO_PATTERNS = ("*teleop*.jsonl", "*cleaned_heuristic*.jsonl")
 
 
 def _timestamp_name(prefix):
@@ -31,6 +32,10 @@ def _run(cmd, env=None, dry_run=False):
     return subprocess.run(cmd, cwd=ROOT, env=env, check=False).returncode
 
 
+def _default_demo_traces(trace_dir):
+    return [str(trace_dir / pattern) for pattern in DEFAULT_DEMO_PATTERNS]
+
+
 def _add_train_args(parser):
     parser.add_argument("traces", nargs="*", help="Teleop trace files, directories, or globs.")
     parser.add_argument("--workflow-python", default=sys.executable, help="Python interpreter used for rl_workflow.py.")
@@ -39,7 +44,7 @@ def _add_train_args(parser):
     parser.add_argument("--trace-dir", type=Path, default=TRACE_DIR)
     parser.add_argument("--output", type=Path, default=RUNTIME_WEIGHTS)
     parser.add_argument("--timesteps", "--steps", dest="timesteps", type=int, default=50000, help="Online Webots environment steps.")
-    parser.add_argument("--pretrain-steps", type=int, default=500, help="SERL updates on the separate teleop demo buffer before online rollout.")
+    parser.add_argument("--pretrain-steps", type=int, default=500, help="SERL updates on the separate demo buffer before online rollout.")
     parser.add_argument("--learning-starts", type=int, help="First online step at which SERL updates are allowed.")
     parser.add_argument("--random-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -76,7 +81,7 @@ def _add_render_args(parser):
 
 
 def _offline_train_cmd(args):
-    traces = args.traces or [str(args.trace_dir / "*teleop*.jsonl")]
+    traces = args.traces or _default_demo_traces(args.trace_dir)
     cmd = [
         args.workflow_python,
         str(WORKFLOW),
@@ -119,7 +124,7 @@ def _offline_train_cmd(args):
 
 
 def _online_train_cmd(args):
-    traces = args.traces or [str(args.trace_dir / "*teleop*.jsonl")]
+    traces = args.traces or _default_demo_traces(args.trace_dir)
     cmd = [
         args.workflow_python,
         str(WORKFLOW),
@@ -235,10 +240,10 @@ def main():
             return rc
 
     if args.offline_pretrain_only:
-        print("SERL demo-only offline update from teleop demos:")
+        print("SERL demo-only offline update from demo traces:")
         rc = _run(_offline_train_cmd(args), env=env, dry_run=args.dry_run)
     else:
-        print("SERL online RL training in Webots with separate teleop demo + online replay buffers:")
+        print("SERL online RL training in Webots with separate demo + online replay buffers:")
         rc = _run(_online_train_cmd(args), env=env, dry_run=args.dry_run)
     if rc != 0:
         return rc
