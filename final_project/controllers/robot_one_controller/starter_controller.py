@@ -996,17 +996,17 @@ class TransitionLogger:
         self.handle = None
 
 
-class BallControlState(Enum):
-    NAVIGATING_TO_BEHIND_BALL = auto()
-    LINING_UP = auto()
-    LINED_UP = auto()
-    QUICK_LINEUP = auto()
-    DRIBBLING = auto()
-    SCORE = auto()
-    BRING_INTO_FIELD = auto()
+class RouteControlPhase(Enum):
+    ACQUIRE_STAGING = auto()
+    TURN_ON_STAGING = auto()
+    READY_TO_PUSH = auto()
+    BACKUP_RESTAGE = auto()
+    PUSH_LANE = auto()
+    FINISH_PUSH = auto()
+    RECOVER_FIELD = auto()
 
 
-class BallControlFSM:
+class GoalRouteController:
     """Finite-state ball control policy driven by the controller's pose and ball estimates."""
 
     MAX_SPEED = 6.67
@@ -1014,7 +1014,7 @@ class BallControlFSM:
     def __init__(self):
         self.goals = [[4.5, 0.0], [-4.5, 0.0]]
         self.posts = [[4.55, 0.8], [4.55, -0.8], [-4.55, 0.8], [-4.55, -0.8]]
-        self.state = BallControlState.NAVIGATING_TO_BEHIND_BALL
+        self.state = RouteControlPhase.ACQUIRE_STAGING
         self.counter = 0
         self.counter_without_ball = 0
         self.pose = (-1.0, 0.0, 0.0)
@@ -1032,9 +1032,9 @@ class BallControlFSM:
         self.path_to_behind_ball = []
         self.path_from_behind_ball_to_goal = []
         self.full_path = []
-        self.started_dribbling = False
-        self.has_lined_up = False
-        self.is_in_line = False
+        self.started_push = False
+        self.heading_ready = False
+        self.staging_ready = False
 
     def step(self, pose, ball_position, ball_rel, ball_visible):
         self.counter += 1
@@ -1054,7 +1054,7 @@ class BallControlFSM:
                 self.path_to_behind_ball,
                 self.path_from_behind_ball_to_goal,
                 self.full_path,
-            ) = self.generate_path()
+            ) = self.rebuild_routes()
         else:
             left_speed, right_speed = self.update()
 
@@ -1065,7 +1065,7 @@ class BallControlFSM:
         return control, self.debug_payload()
 
     def _search_wheel_speeds(self):
-        if self.ball_is_to_right_of_robot():
+        if self.ball_is_on_right():
             return [1.0, -1.0]
         return [-1.0, 1.0]
 
@@ -1115,150 +1115,150 @@ class BallControlFSM:
             self.path_to_behind_ball,
             self.path_from_behind_ball_to_goal,
             self.full_path,
-        ) = self.generate_path()
-        self.path_to_behind_ball = self.densify_path(
+        ) = self.rebuild_routes()
+        self.path_to_behind_ball = self.resample_polyline(
             self.path_to_behind_ball,
             num_points=int(self.ball_distance * 20) + 5,
         )
-        self.path_from_behind_ball_to_goal = self.densify_path(
+        self.path_from_behind_ball_to_goal = self.resample_polyline(
             self.path_from_behind_ball_to_goal,
             num_points=int(self.ball_distance_from_goal * 20) + 5,
         )
-        self.path_to_behind_ball = self.smooth_path(self.path_to_behind_ball)
-        self.path_from_behind_ball_to_goal = self.smooth_path(self.path_from_behind_ball_to_goal)
+        self.path_to_behind_ball = self.smooth_polyline(self.path_to_behind_ball)
+        self.path_from_behind_ball_to_goal = self.smooth_polyline(self.path_from_behind_ball_to_goal)
         self.full_path = self.path_to_behind_ball + self.path_from_behind_ball_to_goal
         self._maybe_transition()
 
         left_speed = right_speed = 1.0
-        if self.state is BallControlState.DRIBBLING:
-            self.target = self.get_path_target(self.path_from_behind_ball_to_goal)
-            if self.close_to_goal():
-                self.turn, speed = self.do_control_dribbling([self.goals[0][0] + 0.5, self.goals[0][1]])
+        if self.state is RouteControlPhase.PUSH_LANE:
+            self.target = self.route_lookahead(self.path_from_behind_ball_to_goal)
+            if self.ball_in_finish_window():
+                self.turn, speed = self.steer_push([self.goals[0][0] + 0.5, self.goals[0][1]])
             else:
-                self.turn, speed = self.do_control_dribbling([self.goals[0][0], self.goals[0][1]])
+                self.turn, speed = self.steer_push([self.goals[0][0], self.goals[0][1]])
             left_speed = right_speed = speed
-            self.has_lined_up = False
-        elif self.state is BallControlState.LINED_UP:
-            self.target = self.get_path_target(self.path_from_behind_ball_to_goal)
-            self.turn = self.do_control(self.target)
-        elif self.state is BallControlState.LINING_UP:
-            self.have_lined_up_behind_ball()
-            self.turn, speed = self.do_control_lined_up()
+            self.heading_ready = False
+        elif self.state is RouteControlPhase.READY_TO_PUSH:
+            self.target = self.route_lookahead(self.path_from_behind_ball_to_goal)
+            self.turn = self.steer_to_point(self.target)
+        elif self.state is RouteControlPhase.TURN_ON_STAGING:
+            self.update_heading_gate()
+            self.turn, speed = self.rotate_on_push_lane()
             left_speed = right_speed = speed
-        elif self.state is BallControlState.QUICK_LINEUP:
-            self.turn, speed = self.do_control_quick_lineup()
-            self.reached_target_behind_ball()
+        elif self.state is RouteControlPhase.BACKUP_RESTAGE:
+            self.turn, speed = self.reverse_to_staging()
+            self.update_staging_gate()
             left_speed = right_speed = speed
-        elif self.state is BallControlState.SCORE:
-            self.target = self.get_path_target(self.path_from_behind_ball_to_goal)
-            self.turn, speed = self.do_control_dribbling([self.goals[0][0] + 0.5, self.goals[0][1]])
+        elif self.state is RouteControlPhase.FINISH_PUSH:
+            self.target = self.route_lookahead(self.path_from_behind_ball_to_goal)
+            self.turn, speed = self.steer_push([self.goals[0][0] + 0.5, self.goals[0][1]])
             left_speed = right_speed = speed
         else:
-            self.reached_target_behind_ball()
+            self.update_staging_gate()
             if not self.path_to_behind_ball:
-                self.turn = self.do_control([self.x_behind_ball, self.y_behind_ball])
+                self.turn = self.steer_to_point([self.x_behind_ball, self.y_behind_ball])
             else:
-                self.target = self.get_path_target(self.path_to_behind_ball)
-                self.turn = self.do_control(self.target)
+                self.target = self.route_lookahead(self.path_to_behind_ball)
+                self.turn = self.steer_to_point(self.target)
         return left_speed, right_speed
 
     def _maybe_transition(self):
         current = self.state
         next_state = current
-        if current is BallControlState.NAVIGATING_TO_BEHIND_BALL:
-            if self.behind_ball() and self.is_in_line:
-                next_state = BallControlState.LINING_UP
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.LINING_UP:
-            if not self.behind_ball():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
-            elif self.has_lined_up:
-                next_state = BallControlState.LINED_UP
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.LINED_UP:
-            if not self.behind_ball():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
-            elif self.dribbling() and self.is_in_line:
-                next_state = BallControlState.DRIBBLING
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.QUICK_LINEUP:
-            if self.behind_ball() and self.is_in_line:
-                next_state = BallControlState.LINING_UP
-            elif not self.behind_ball():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.DRIBBLING:
-            if not self.ball_is_close_enough_to_dribble():
-                next_state = BallControlState.QUICK_LINEUP
-            elif not self.behind_ball():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
-            elif self.close_to_goal() and self.is_in_line:
-                next_state = BallControlState.SCORE
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.SCORE:
-            if not self.ball_is_close_enough_to_dribble():
-                next_state = BallControlState.QUICK_LINEUP
-            elif not self.behind_ball():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
-            elif not self.ball_is_in_field():
-                next_state = BallControlState.BRING_INTO_FIELD
-        elif current is BallControlState.BRING_INTO_FIELD:
-            if self.ball_is_in_field():
-                next_state = BallControlState.NAVIGATING_TO_BEHIND_BALL
+        if current is RouteControlPhase.ACQUIRE_STAGING:
+            if self.robot_is_behind_ball() and self.staging_ready:
+                next_state = RouteControlPhase.TURN_ON_STAGING
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.TURN_ON_STAGING:
+            if not self.robot_is_behind_ball():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
+            elif self.heading_ready:
+                next_state = RouteControlPhase.READY_TO_PUSH
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.READY_TO_PUSH:
+            if not self.robot_is_behind_ball():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
+            elif self.ready_to_push() and self.staging_ready:
+                next_state = RouteControlPhase.PUSH_LANE
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.BACKUP_RESTAGE:
+            if self.robot_is_behind_ball() and self.staging_ready:
+                next_state = RouteControlPhase.TURN_ON_STAGING
+            elif not self.robot_is_behind_ball():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.PUSH_LANE:
+            if not self.ball_centered_for_push():
+                next_state = RouteControlPhase.BACKUP_RESTAGE
+            elif not self.robot_is_behind_ball():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
+            elif self.ball_in_finish_window() and self.staging_ready:
+                next_state = RouteControlPhase.FINISH_PUSH
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.FINISH_PUSH:
+            if not self.ball_centered_for_push():
+                next_state = RouteControlPhase.BACKUP_RESTAGE
+            elif not self.robot_is_behind_ball():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
+            elif not self.ball_inside_work_area():
+                next_state = RouteControlPhase.RECOVER_FIELD
+        elif current is RouteControlPhase.RECOVER_FIELD:
+            if self.ball_inside_work_area():
+                next_state = RouteControlPhase.ACQUIRE_STAGING
         self._transition_to(next_state)
 
     def _transition_to(self, next_state):
         if next_state is self.state:
             return
         exit_hook = {
-            BallControlState.DRIBBLING: self._on_exit_dribbling,
-            BallControlState.BRING_INTO_FIELD: self._on_exit_bring_to_field,
-            BallControlState.NAVIGATING_TO_BEHIND_BALL: self._on_exit_navigating,
+            RouteControlPhase.PUSH_LANE: self._leave_push_lane,
+            RouteControlPhase.RECOVER_FIELD: self._restore_attack_goal,
+            RouteControlPhase.ACQUIRE_STAGING: self._accept_staging_gate,
         }.get(self.state)
         if exit_hook:
             exit_hook()
         self.state = next_state
         enter_hook = {
-            BallControlState.NAVIGATING_TO_BEHIND_BALL: self._on_enter_navigating,
-            BallControlState.QUICK_LINEUP: self._on_enter_quick_lineup,
-            BallControlState.DRIBBLING: self._on_enter_dribbling,
-            BallControlState.BRING_INTO_FIELD: self._on_enter_bring_to_field,
+            RouteControlPhase.ACQUIRE_STAGING: self._reset_staging_flags,
+            RouteControlPhase.BACKUP_RESTAGE: self._reset_backup_flags,
+            RouteControlPhase.PUSH_LANE: self._mark_push_started,
+            RouteControlPhase.RECOVER_FIELD: self._redirect_to_field_center,
         }.get(self.state)
         if enter_hook:
             enter_hook()
 
-    def _on_enter_navigating(self):
-        self.started_dribbling = False
-        self.has_lined_up = False
-        self.is_in_line = False
+    def _reset_staging_flags(self):
+        self.started_push = False
+        self.heading_ready = False
+        self.staging_ready = False
 
-    def _on_enter_quick_lineup(self):
-        self.has_lined_up = False
-        self.is_in_line = False
+    def _reset_backup_flags(self):
+        self.heading_ready = False
+        self.staging_ready = False
 
-    def _on_enter_dribbling(self):
-        self.started_dribbling = True
+    def _mark_push_started(self):
+        self.started_push = True
 
-    def _on_enter_bring_to_field(self):
+    def _redirect_to_field_center(self):
         self.goals[0][0] = 0.0
         self.goals[0][1] = 0.0
 
-    def _on_exit_dribbling(self):
+    def _leave_push_lane(self):
         pass
 
-    def _on_exit_bring_to_field(self):
+    def _restore_attack_goal(self):
         self.goals[0][0] = 4.5
         self.goals[0][1] = 0.0
 
-    def _on_exit_navigating(self):
-        self.is_in_line = True
+    def _accept_staging_gate(self):
+        self.staging_ready = True
 
-    def densify_path(self, path, num_points=50):
+    def resample_polyline(self, path, num_points=50):
         path = np.array(path, dtype=float)
         if len(path) < 2:
             return path.tolist()
@@ -1290,7 +1290,7 @@ class BallControlFSM:
             new_path.append(path[-1].tolist())
         return new_path
 
-    def move_points(self, points, obstacles, influence_radius=0.3, strength=0.12):
+    def apply_clearance_field(self, points, obstacles, influence_radius=0.3, strength=0.12):
         new_points = []
         for x, y in points:
             total_dx = 0.0
@@ -1308,23 +1308,23 @@ class BallControlFSM:
             new_points.append([x + total_dx, y + total_dy])
         return new_points
 
-    def smooth_path(self, path, alpha=0.2):
+    def smooth_polyline(self, path, alpha=0.2):
         smoothed = [list(point) for point in path]
         for i in range(1, len(path) - 1):
             smoothed[i][0] = (1 - alpha) * path[i][0] + alpha * (path[i - 1][0] + path[i + 1][0]) / 2
             smoothed[i][1] = (1 - alpha) * path[i][1] + alpha * (path[i - 1][1] + path[i + 1][1]) / 2
         return smoothed
 
-    def generate_path(self):
-        if self.distance_to_behind_ball > 0.1 and not self.dribbling():
+    def rebuild_routes(self):
+        if self.distance_to_behind_ball > 0.1 and not self.ready_to_push():
             path_to_behind_ball = [
                 [self.pose[0], self.pose[1]],
                 [self.x_behind_ball, self.y_behind_ball],
             ]
-            path_to_behind_ball = self.densify_path(path_to_behind_ball, num_points=int(self.ball_distance * 20))
+            path_to_behind_ball = self.resample_polyline(path_to_behind_ball, num_points=int(self.ball_distance * 20))
             obstacles = [[float(self.global_pos_ball[0]), float(self.global_pos_ball[1])]]
             obstacles.extend([[float(pt[0]), float(pt[1])] for pt in self.posts])
-            path_to_behind_ball = self.move_points(path_to_behind_ball, obstacles)
+            path_to_behind_ball = self.apply_clearance_field(path_to_behind_ball, obstacles)
         else:
             path_to_behind_ball = [[self.pose[0], self.pose[1]]]
 
@@ -1339,20 +1339,20 @@ class BallControlFSM:
                 [float(self.global_pos_ball[0]), float(self.global_pos_ball[1])],
                 [float(self.goals[0][0] + 0.5), float(self.goals[0][1])],
             ]
-        path_from_behind_ball_to_goal = self.densify_path(
+        path_from_behind_ball_to_goal = self.resample_polyline(
             path_from_behind_ball_to_goal,
             num_points=int((self.ball_distance + self.ball_distance_from_goal) * 20 + 5),
         )
         obstacles = [[float(pt[0]), float(pt[1])] for pt in self.posts]
-        path_from_behind_ball_to_goal = self.move_points(path_from_behind_ball_to_goal, obstacles)
+        path_from_behind_ball_to_goal = self.apply_clearance_field(path_from_behind_ball_to_goal, obstacles)
         return path_to_behind_ball, path_from_behind_ball_to_goal, path_to_behind_ball + path_from_behind_ball_to_goal[1:]
 
-    def dribbling(self):
+    def ready_to_push(self):
         if self.ball_distance < 0.15:
-            return self.ball_is_close_enough_to_dribble()
+            return self.ball_centered_for_push()
         return False
 
-    def ball_is_close_enough_to_dribble(self):
+    def ball_centered_for_push(self):
         angle_to_ball = wrap_to_pi(
             math.atan2(-self.pose[1] + self.global_pos_ball[1], -self.pose[0] + self.global_pos_ball[0])
         )
@@ -1370,12 +1370,12 @@ class BallControlFSM:
             abs(angle_between_post_and_goal) + math.radians(10 * self.ball_distance_from_goal)
         )
 
-    def do_control(self, target):
+    def steer_to_point(self, target):
         angle_to_target = math.atan2(target[1] - self.pose[1], target[0] - self.pose[0])
         angle_diff = wrap_to_pi(angle_to_target - self.pose[2])
         return max(min(angle_diff, 1), -1)
 
-    def do_control_dribbling(self, target):
+    def steer_push(self, target):
         angle_to_target = math.atan2(target[1] - self.pose[1], target[0] - self.pose[0])
         angle_diff = wrap_to_pi(angle_to_target - self.pose[2] + self.ball_angle / 5)
         turn = max(min(angle_diff, 1), -1)
@@ -1383,7 +1383,7 @@ class BallControlFSM:
             turn *= 3
         return turn, 1.0
 
-    def get_path_target(self, path):
+    def route_lookahead(self, path):
         if len(path) < 2:
             return self.global_pos_ball
         min_dist = float("inf")
@@ -1395,10 +1395,10 @@ class BallControlFSM:
                 closest_idx = i
         return path[min(closest_idx + 3, len(path) - 1)]
 
-    def behind_ball(self):
+    def robot_is_behind_ball(self):
         return self.pose[0] < self.global_pos_ball[0]
 
-    def have_lined_up_behind_ball(self):
+    def update_heading_gate(self):
         if self.ball_distance_from_goal > 0.5:
             angle_ball_to_goal = math.atan2(
                 self.goals[0][1] - self.global_pos_ball[1],
@@ -1410,10 +1410,10 @@ class BallControlFSM:
                 self.goals[0][0] + 0.5 - self.global_pos_ball[0],
             )
         angle_diff = wrap_to_pi(angle_ball_to_goal - self.pose[2])
-        self.has_lined_up = abs(angle_diff) < math.radians(2)
+        self.heading_ready = abs(angle_diff) < math.radians(2)
         return abs(angle_diff) < math.radians(3)
 
-    def reached_target_behind_ball(self, tolerance=0.02):
+    def update_staging_gate(self, tolerance=0.02):
         rx, ry = self.pose[0], self.pose[1]
         bx, by = self.global_pos_ball[0], self.global_pos_ball[1]
         if self.ball_distance_from_goal > 0.5:
@@ -1427,10 +1427,10 @@ class BallControlFSM:
             return False
         perpendicular_dist = abs(line_vec[0] * robot_vec[1] - line_vec[1] * robot_vec[0]) / line_length
         projection = np.dot(robot_vec, line_vec) / line_length
-        self.is_in_line = perpendicular_dist < tolerance and projection < 0
-        return self.is_in_line
+        self.staging_ready = perpendicular_dist < tolerance and projection < 0
+        return self.staging_ready
 
-    def do_control_lined_up(self):
+    def rotate_on_push_lane(self):
         if self.ball_distance_from_goal > 0.5:
             angle_ball_to_goal = math.atan2(
                 self.goals[0][1] - self.global_pos_ball[1],
@@ -1444,7 +1444,7 @@ class BallControlFSM:
         angle_diff = wrap_to_pi(angle_ball_to_goal - self.pose[2])
         return max(min(angle_diff * 15, 1), -1), 0.0
 
-    def do_control_quick_lineup(self):
+    def reverse_to_staging(self):
         dx = self.x_behind_ball - self.pose[0]
         dy = self.y_behind_ball - self.pose[1]
         angle_to_behind = math.atan2(dy, dx)
@@ -1452,18 +1452,18 @@ class BallControlFSM:
         angle_diff = wrap_to_pi(angle_to_behind - backward_heading)
         return max(min(angle_diff * 15, 1), -1), -1.0
 
-    def close_to_goal(self):
+    def ball_in_finish_window(self):
         return self.ball_distance_from_goal < 0.5
 
-    def ball_is_in_field(self):
+    def ball_inside_work_area(self):
         return -4.4 < self.global_pos_ball[0] < 4.4 and -2.9 < self.global_pos_ball[1] < 2.9
 
-    def ball_is_to_right_of_robot(self):
+    def ball_is_on_right(self):
         return self.ball_angle < 0
 
     def debug_payload(self):
         return {
-            "mode": "ball_control_fsm",
+            "mode": "goal_route_controller",
             "state": self.state.name,
             "target": [float(self.target[0]), float(self.target[1])],
             "staging": [float(self.x_behind_ball), float(self.y_behind_ball)],
@@ -1484,9 +1484,9 @@ class StudentController:
         self.ball_tracker = BallTracker()
         self.visualizer = LiveVisualizerClient()
         self.transition_logger = TransitionLogger()
-        self.ball_control = BallControlFSM()
+        self.ball_control = GoalRouteController()
 
-        self.state = "BALL_CONTROL_INIT"
+        self.state = "ROUTE_CONTROL_INIT"
         self.state_age = 0
         self.step_count = 0
         self.odom_pose = (-1.0, 0.0, 0.0)
@@ -1824,7 +1824,7 @@ class StudentController:
         payload = {
             "step": self.step_count,
             "state": self.state,
-            "control_mode": "ball_control_fsm",
+            "control_mode": "goal_route_controller",
             "estimated_pose": [float(v) for v in pose],
             "fused_pose": [float(v) for v in pose],
             "odom_pose": [float(v) for v in self.odom_pose],
@@ -1906,7 +1906,7 @@ class StudentController:
             ball_rel,
             ball_visible,
         )
-        self._set_control_state(f"BALL_CONTROL_{debug['state']}")
+        self._set_control_state(f"ROUTE_CONTROL_{debug['state']}")
         self.last_control_plan = {
             "mode": debug["mode"],
             "control_state": debug["state"],
